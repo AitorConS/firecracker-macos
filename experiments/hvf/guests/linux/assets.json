@@ -1,0 +1,14 @@
+{
+  "vmlinuz-virt": {
+    "url": "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/aarch64/netboot-3.23.5/vmlinuz-virt",
+    "sha256": "1a2fa67cb25a2fa9065818712d50d0d543526818b3c6b43695e54deaca33d66d"
+  },
+  "initramfs-virt": {
+    "url": "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/aarch64/netboot-3.23.5/initramfs-virt",
+    "sha256": "df5281b4c36f812d0507e219e31a8a7482e0b4175097e292b75c7872c441295c"
+  },
+  "modloop-virt": {
+    "url": "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/aarch64/netboot-3.23.5/modloop-virt",
+    "sha256": "83599ae8dbdd48ab452600c00bce8dd1c0c77075223196732cd99b7f8d774f89"
+  }
+}

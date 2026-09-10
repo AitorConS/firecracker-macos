@@ -1,0 +1,16 @@
+#!/bin/sh
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+modprobe virtio_pci
+modprobe virtio_blk
+modprobe virtio_net
+modprobe virtio_mmio
+modprobe virtio_input
+insmod /evdev.ko
+ip link set lo up
+ip link set eth0 up
+ip addr add 10.0.2.15/24 dev eth0
+ip route add default via 10.0.2.2
+exec /vmm-test

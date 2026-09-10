@@ -1,0 +1,268 @@
+// SPDX-License-Identifier: Apache-2.0
+// Bring-up laboratory; deliberately independent of the Linux Firecracker VMM.
+#include <Hypervisor/Hypervisor.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <pthread.h>
+#include "devices.h"
+#include "net.h"
+#include "hvf.h"
+#include "input.h"
+#include <stdatomic.h>
+#include <signal.h>
+#include <errno.h>
+
+#define RAM_BASE 0x40000000ULL
+static size_t ram_size;
+#define CHECK(expr) do { hv_return_t r = (expr); if (r != HV_SUCCESS) { \
+    fprintf(stderr, "%s: 0x%x\n", #expr, r); exit(1); } } while (0)
+
+static int mmio(uint64_t addr, unsigned size, int write, uint64_t *value) {
+    // PL011 transmit console, register interface and level TX interrupt.
+    static uint32_t uart[19];
+    if(addr>=0x09000fe0 && addr<=0x09000ffc && !(addr&3) && !write && size<=4){
+        const uint8_t ids[]={0x11,0x10,0x14,0,0x0d,0xf0,0x05,0xb1};
+        *value=ids[(addr-0x09000fe0)/4];return 1;
+    }
+    if(addr>=0x09000000 && addr<=0x09000048 && !(addr&3) && (size==1||size==2||size==4)){
+        unsigned off=addr-0x09000000;
+        if(write){
+            if(off==0){putchar(*value&255);fflush(stdout);}
+            else uart[off/4]=*value;
+            if(off==0x38 || off==0x44)CHECK(hv_gic_set_spi(33,(uart[0x38/4]&0x20)!=0));
+        }else if(off==0x18)*value=0x90;
+        else if(off==0x3c)*value=0x20;
+        else if(off==0x40)*value=uart[0x38/4]&0x20;
+        else if(off==0)*value=0;
+        else *value=uart[off/4];
+        return 1;
+    }
+    // Read-only PL031 clock and identification; no interrupt emulation.
+    if (addr == 0x09010000 && !write && size == 4) {
+        *value = (uint32_t)time(NULL); return 1;
+    }
+    if (addr >= 0x09010fe0 && addr <= 0x09010ffc &&
+        !(addr & 3) && !write && (size == 1 || size == 4)) {
+        const uint8_t ids[] = {0x31,0x10,0x04,0x00,0x0d,0xf0,0x05,0xb1};
+        *value = ids[(addr - 0x09010fe0) / 4]; return 1;
+    }
+    if (input_mmio(addr,size,write,value))return 1;
+    if (net_mmio(addr,size,write,value)) return 1;
+    return devices_mmio(addr, size, write, value);
+}
+
+
+#define MAX_CPUS 4
+struct cpu {
+    hv_vcpu_t id;
+    pthread_t thread;
+    unsigned index;
+    int ready, started;
+    uint64_t entry, context, os_lock, os_double_lock;
+};
+static struct cpu cpus[MAX_CPUS];
+static unsigned ncpus=1;
+static const struct hvf_options *options;
+static pthread_mutex_t io_lock=PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t state_lock=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t state_change=PTHREAD_COND_INITIALIZER;
+static atomic_int result=-1;
+static volatile sig_atomic_t stop_requested;
+static void stop_signal(int sig){stop_requested=sig;}
+static unsigned stopped;
+static int teardown_released;
+
+static double seconds(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    return t.tv_sec+t.tv_nsec/1e9;
+}
+static void finish(int status) {
+    int expected=-1;
+    atomic_compare_exchange_strong(&result,&expected,status);
+}
+static void *cpu_main(void *arg) {
+    struct cpu *c=arg;
+    hv_vcpu_exit_t *ex;
+    CHECK(hv_vcpu_create(&c->id,&ex,NULL));
+    CHECK(hv_vcpu_set_sys_reg(c->id,HV_SYS_REG_MPIDR_EL1,0x80000000|c->index));
+    CHECK(hv_vcpu_set_reg(c->id,HV_REG_CPSR,0x3c5));
+    CHECK(hv_vcpu_set_sys_reg(c->id,HV_SYS_REG_SCTLR_EL1,0x30900180));
+    CHECK(hv_vcpu_set_reg(c->id,HV_REG_X1,0));
+    CHECK(hv_vcpu_set_reg(c->id,HV_REG_X2,0));
+    CHECK(hv_vcpu_set_reg(c->id,HV_REG_X3,0));
+    pthread_mutex_lock(&state_lock);
+    c->ready=1;pthread_cond_broadcast(&state_change);
+    while(!c->started && atomic_load(&result)<0)pthread_cond_wait(&state_change,&state_lock);
+    pthread_mutex_unlock(&state_lock);
+    CHECK(hv_vcpu_set_reg(c->id,HV_REG_PC,c->entry));
+    CHECK(hv_vcpu_set_reg(c->id,HV_REG_X0,c->context));
+    unsigned long exits=0;
+    while(atomic_load(&result)<0) {
+        exits++;
+        CHECK(hv_vcpu_run(c->id));
+        if(ex->reason==HV_EXIT_REASON_CANCELED)continue;
+        pthread_mutex_lock(&io_lock);
+        uint64_t pc;
+        CHECK(hv_vcpu_get_reg(c->id,HV_REG_PC,&pc));
+        uint64_t esr=ex->exception.syndrome;
+        unsigned ec=(unsigned)(esr>>26);
+        if(options->trace)fprintf(stderr,"cpu=%u exit=%lu ec=%x pc=%llx ipa=%llx esr=%llx\n",c->index,exits,ec,pc,ex->exception.physical_address,esr);
+        if(ex->reason==HV_EXIT_REASON_EXCEPTION && ec==0x24 && (esr&(1ULL<<24))) {
+            unsigned reg=(esr>>16)&31,size=1U<<((esr>>22)&3);
+            int write=(esr>>6)&1;
+            uint64_t value=0;
+            if(!write && (esr&(1ULL<<21)))goto unsupported;
+            if(write && reg!=31)CHECK(hv_vcpu_get_reg(c->id,(hv_reg_t)(HV_REG_X0+reg),&value));
+            if(!mmio(ex->exception.physical_address,size,write,&value))goto unsupported;
+            if(size<8)value&=(1ULL<<(size*8))-1;
+            if(!write && reg!=31)CHECK(hv_vcpu_set_reg(c->id,(hv_reg_t)(HV_REG_X0+reg),value));
+            CHECK(hv_vcpu_set_reg(c->id,HV_REG_PC,pc+4));
+            if(devices_exit_status()>=0)finish(devices_exit_status());
+        } else if(ex->reason==HV_EXIT_REASON_EXCEPTION && ec==0x18) {
+            unsigned rt=(esr>>5)&31,read=esr&1;
+            unsigned op0=(esr>>20)&3,op1=(esr>>14)&7,crn=(esr>>10)&15,crm=(esr>>1)&15,op2=(esr>>17)&7;
+            uint64_t value=0;
+            if(!read && rt!=31)CHECK(hv_vcpu_get_reg(c->id,(hv_reg_t)(HV_REG_X0+rt),&value));
+            if(op0==2 && op1==0 && crn==1 && op2==4 && (crm==0||crm==1||crm==3)){
+                if(crm==0){if(read)goto unsupported;c->os_lock=value&1;}
+                else if(crm==1){if(!read)goto unsupported;value=8|(c->os_lock<<1);}
+                else {if(read)value=c->os_double_lock;else c->os_double_lock=value&1;}
+            }else {
+                hv_sys_reg_t sys=(hv_sys_reg_t)((op0<<14)|(op1<<11)|(crn<<7)|(crm<<3)|op2);
+                hv_return_t r=read?hv_vcpu_get_sys_reg(c->id,sys,&value):hv_vcpu_set_sys_reg(c->id,sys,value);
+                if(r!=HV_SUCCESS)goto unsupported;
+            }
+            if(read && rt!=31)CHECK(hv_vcpu_set_reg(c->id,(hv_reg_t)(HV_REG_X0+rt),value));
+            CHECK(hv_vcpu_set_reg(c->id,HV_REG_PC,pc+4));
+        } else if(ex->reason==HV_EXIT_REASON_EXCEPTION && ec==0x16) {
+            uint64_t call,ret=(uint64_t)-1;
+            CHECK(hv_vcpu_get_reg(c->id,HV_REG_X0,&call));
+            if(call==0x84000008) {fprintf(stderr,"HVF: PSCI SYSTEM_OFF\n");finish(0);}
+            else if(call==0x84000009) {fprintf(stderr,"HVF: PSCI SYSTEM_RESET requested\n");finish(3);}
+            else if(call==0x84000000)ret=0x00000002; // PSCI 0.2
+            else if(call==0xc4000003 || call==0x84000003) {
+                uint64_t target,entry,context;
+                CHECK(hv_vcpu_get_reg(c->id,HV_REG_X1,&target));
+                CHECK(hv_vcpu_get_reg(c->id,HV_REG_X2,&entry));
+                CHECK(hv_vcpu_get_reg(c->id,HV_REG_X3,&context));
+                fprintf(stderr,"CPU_ON target=%llx entry=%llx context=%llx\n",target,entry,context);
+                ret=(uint64_t)-2;
+                if(target<ncpus && entry>=RAM_BASE && entry<RAM_BASE+ram_size && !(entry&3)) {
+                    pthread_mutex_lock(&state_lock);
+                    struct cpu *other=&cpus[target];
+                    if(other->started)ret=(uint64_t)-4;
+                    else {other->entry=entry;other->context=context;other->started=1;ret=0;pthread_cond_broadcast(&state_change);}
+                    pthread_mutex_unlock(&state_lock);
+                }
+            }
+            CHECK(hv_vcpu_set_reg(c->id,HV_REG_X0,ret));
+        } else {
+unsupported:
+            fprintf(stderr,"unsupported exit: cpu=%u reason=%u ec=%x esr=%llx pc=%llx ipa=%llx\n",c->index,ex->reason,ec,esr,pc,ex->exception.physical_address);
+            uint64_t fault_esr,fault_elr;
+            CHECK(hv_vcpu_get_sys_reg(c->id,HV_SYS_REG_ESR_EL1,&fault_esr));
+            CHECK(hv_vcpu_get_sys_reg(c->id,HV_SYS_REG_ELR_EL1,&fault_elr));
+            fprintf(stderr,"guest exception: ESR_EL1=%llx ELR_EL1=%llx\n",fault_esr,fault_elr);
+            finish(2);
+        }
+        pthread_mutex_unlock(&io_lock);
+    }
+    if(atomic_load(&result)<0)finish(2);
+    // Every vCPU must stop before the GIC topology is dismantled.
+    pthread_mutex_lock(&state_lock);
+    stopped++;pthread_cond_broadcast(&state_change);
+    while(stopped<ncpus || !teardown_released)pthread_cond_wait(&state_change,&state_lock);
+    pthread_mutex_unlock(&state_lock);
+    CHECK(hv_vcpu_destroy(c->id));
+    return NULL;
+}
+
+int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hvf_options *settings) {
+    struct sigaction action={0};action.sa_handler=stop_signal;sigemptyset(&action.sa_mask);
+    sigaction(SIGTERM,&action,NULL);sigaction(SIGINT,&action,NULL);
+    options=settings;
+    ncpus=options->cpus;
+    if(options->memory_mib<64||options->memory_mib>2048)return 1;
+    ram_size=(size_t)options->memory_mib<<20;
+    if(ncpus<1 || ncpus>MAX_CPUS || entry<RAM_BASE || entry>=RAM_BASE+ram_size || (entry&3))return 1;
+    int fd=open(ram_path,O_RDONLY);struct stat st;
+    if(fd<0||fstat(fd,&st)||st.st_size<=0 || (uint64_t)st.st_size>ram_size){fprintf(stderr,"RAM image length does not match configured memory\n");if(fd>=0)close(fd);return 1;}
+    void *ram=mmap(NULL,ram_size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
+    if(ram==MAP_FAILED){perror("mmap");close(fd);return 1;}
+    size_t loaded=0;
+    while(loaded<(size_t)st.st_size){
+        ssize_t n=pread(fd,(uint8_t*)ram+loaded,(size_t)st.st_size-loaded,loaded);
+        if(n<0 && errno==EINTR)continue;
+        if(n<=0){perror("read RAM image");close(fd);munmap(ram,ram_size);return 1;}
+        loaded+=n;
+    }
+    close(fd);
+    input_init(ram,ram_size,options->power_button);
+    if(devices_init(ram,ram_size,disk,options)){perror("disk");devices_close();munmap(ram,ram_size);return 1;}
+    if(net_init(ram,ram_size,options)){fprintf(stderr,"network setup failed\n");net_close();devices_close();munmap(ram,ram_size);return 1;}
+    CHECK(hv_vm_create(NULL));
+    CHECK(hv_vm_map(ram,RAM_BASE,ram_size,HV_MEMORY_READ|HV_MEMORY_WRITE|HV_MEMORY_EXEC));
+    hv_gic_config_t gic=hv_gic_config_create();
+    CHECK(hv_gic_config_set_distributor_base(gic,0x08000000));
+    CHECK(hv_gic_config_set_redistributor_base(gic,0x080a0000));
+    CHECK(hv_gic_config_set_msi_region_base(gic,0x08020000));
+    CHECK(hv_gic_config_set_msi_interrupt_range(gic,64,64));
+    CHECK(hv_gic_create(gic));os_release(gic);
+    fprintf(stderr,"HVF: %u vCPU, %u MiB, entry=0x%llx\n",ncpus,options->memory_mib,entry);
+    for(unsigned i=0;i<ncpus;i++) {
+        cpus[i].index=i;
+        if(pthread_create(&cpus[i].thread,NULL,cpu_main,&cpus[i])){fprintf(stderr,"vCPU thread creation failed\n");exit(1);}
+        pthread_mutex_lock(&state_lock);
+        while(!cpus[i].ready)pthread_cond_wait(&state_change,&state_lock);
+        pthread_mutex_unlock(&state_lock);
+    }
+    pthread_mutex_lock(&state_lock);
+    for(unsigned i=0;i<ncpus;i++)while(!cpus[i].ready)pthread_cond_wait(&state_change,&state_lock);
+    if(options->ready_fd>=0){if(write(options->ready_fd,"R",1)!=1){fprintf(stderr,"startup supervisor disconnected\n");exit(1);}}
+    cpus[0].entry=entry;cpus[0].context=RAM_BASE;cpus[0].started=1;
+    pthread_cond_broadcast(&state_change);pthread_mutex_unlock(&state_lock);
+    double deadline=seconds()+options->timeout_ms/1000.0;
+    int power_pending=0;
+    while(atomic_load(&result)<0) {
+        if(stop_requested)finish(128+stop_requested);
+        if(options->ready_fd>=0){
+            char byte;ssize_t n=recv(options->ready_fd,&byte,1,MSG_DONTWAIT);
+            if(n==1){if(byte=='S')power_pending=1;else if(byte=='X')power_pending=0;else finish(2);}
+            if(n==0){fprintf(stderr,"HVF: supervisor disconnected\n");finish(143);}
+            else if(n<0 && errno!=EAGAIN && errno!=EWOULDBLOCK && errno!=EINTR)finish(2);
+        }
+        pthread_mutex_lock(&io_lock);devices_poll();net_poll();
+        if(power_pending && input_power_button()){power_pending=0;if(write(options->ready_fd,"A",1)!=1)finish(143);}
+        pthread_mutex_unlock(&io_lock);
+        if(options->timeout_ms && seconds()>=deadline){fprintf(stderr,"HVF: watchdog deadline\n");finish(124);}
+        usleep(1000);
+    }
+    pthread_mutex_lock(&state_lock);pthread_cond_broadcast(&state_change);pthread_mutex_unlock(&state_lock);
+    // A canceled exit wakes sleeping/running CPUs so all can join teardown.
+    hv_vcpu_t ids[MAX_CPUS];for(unsigned i=0;i<ncpus;i++)ids[i]=cpus[i].id;
+    CHECK(hv_vcpus_exit(ids,ncpus));
+    pthread_mutex_lock(&state_lock);teardown_released=1;pthread_cond_broadcast(&state_change);pthread_mutex_unlock(&state_lock);
+    for(unsigned i=0;i<ncpus;i++)pthread_join(cpus[i].thread,NULL);
+    CHECK(hv_vm_unmap(RAM_BASE,ram_size));CHECK(hv_vm_destroy());
+    net_close();devices_close();munmap(ram,ram_size);
+    if(options->ready_fd>=0)close(options->ready_fd);
+    return atomic_load(&result);
+}
+
+#ifdef HVF_STANDALONE
+int main(int argc,char **argv) {
+    if(argc!=3 && argc!=4)return 1;
+    char *end;uint64_t entry=strtoull(argv[2],&end,16);if(*end)return 1;
+    struct hvf_options settings={.cpus=1,.memory_mib=128,.timeout_ms=10000,.ready_fd=-1};
+    if(getenv("HVF_CPUS")){settings.cpus=strtoul(getenv("HVF_CPUS"),&end,10);if(*end)return 1;}
+    settings.trace=getenv("HVF_TRACE")!=NULL;
+    return hvf_run(argv[1],entry,argc==4?argv[3]:NULL,&settings);
+}
+#endif

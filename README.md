@@ -4,6 +4,12 @@
    <img alt="Firecracker Logo Title" width="750" src="docs/images/fc_logo_full_transparent-bg.png">
 </picture>
 
+This local branch adds an **experimental macOS ARM64 / Hypervisor.framework
+backend for generic Linux and ELF guests**. See [build instructions, demo, tests and known
+limitations](experiments/hvf/README.md). The Darwin backend does not yet provide
+the upstream Linux VMM's API, snapshot or security parity; the upstream project
+description below describes Firecracker on Linux.
+
 Our mission is to enable secure, multi-tenant, minimal-overhead execution of
 container and function workloads.
 

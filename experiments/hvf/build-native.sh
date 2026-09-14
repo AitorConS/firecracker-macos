@@ -8,10 +8,12 @@ if ! command -v cargo >/dev/null 2>&1; then
     export PATH="$CARGO_HOME/bin:/opt/homebrew/bin:$PATH"
 fi
 export RUSTUP_TOOLCHAIN=1.97.0
-# The currently validated libslirp Homebrew build requires macOS 26.
+# The HVF backend and pinned native dependencies target macOS 26.
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-26.0}"
-cargo build -p firecracker --target aarch64-apple-darwin --release
-mkdir -p build/macos-arm64
-cp build/cargo_target/aarch64-apple-darwin/release/firecracker build/macos-arm64/firecracker
-codesign --force --sign - --entitlements experiments/hvf/entitlements.plist build/macos-arm64/firecracker
-file build/macos-arm64/firecracker
+cargo build --locked -p firecracker --target aarch64-apple-darwin --release
+output=${HVF_OUTPUT_DIR:-build/macos-arm64}
+target=${CARGO_TARGET_DIR:-build/cargo_target}
+mkdir -p "$output"
+cp "$target/aarch64-apple-darwin/release/firecracker" "$output/firecracker"
+codesign --force --sign - --entitlements experiments/hvf/entitlements.plist "$output/firecracker"
+file "$output/firecracker"

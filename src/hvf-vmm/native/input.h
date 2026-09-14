@@ -5,3 +5,6 @@
 void input_init(void *,size_t,int);
 int input_mmio(uint64_t,unsigned,int,uint64_t *);
 int input_power_button(void);
+
+#include "snapshot_io.h"
+void input_snapshot(struct snapshot_io *s);

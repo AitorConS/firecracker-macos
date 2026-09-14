@@ -1,199 +1,123 @@
-<picture>
-   <source media="(prefers-color-scheme: dark)" srcset="docs/images/fc_logo_full_transparent-bg_white-fg.png">
-   <source media="(prefers-color-scheme: light)" srcset="docs/images/fc_logo_full_transparent-bg.png">
-   <img alt="Firecracker Logo Title" width="750" src="docs/images/fc_logo_full_transparent-bg.png">
-</picture>
+# Firecracker for macOS
 
-This local branch adds an **experimental macOS ARM64 / Hypervisor.framework
-backend for generic Linux and ELF guests**. See [build instructions, demo, tests and known
-limitations](experiments/hvf/README.md). The Darwin backend does not yet provide
-the upstream Linux VMM's API, snapshot or security parity; the upstream project
-description below describes Firecracker on Linux.
+Run lightweight ARM64 virtual machines on Apple Silicon using Apple's
+Hypervisor.framework. Boot Linux or an ELF unikernel, attach disks, configure
+networking, and manage the VM through a local HTTP API.
 
-Our mission is to enable secure, multi-tenant, minimal-overhead execution of
-container and function workloads.
+This is an independent, experimental fork of
+[Firecracker](https://github.com/firecracker-microvm/firecracker), not an official
+AWS release. The original Linux/KVM backend remains available.
 
-Read more about the Firecracker Charter [here](CHARTER.md).
+## What You Can Do
 
-## What is Firecracker?
+- Boot ARM64 Linux Image/initramfs or ELF guests with 1-4 vCPUs and 64-2048 MiB RAM.
+- Attach up to four file-backed VirtIO disks, with read-only and copy-on-start modes.
+- Use user-mode networking with explicit TCP/UDP forwarding, or connect an external
+  Ethernet switch over a Unix socket.
+- Start, stop, pause, resume, and inspect VMs through a private Unix-socket API.
+- Save and restore local snapshots, with explicit network reconnection.
+- Inspect JSON or Prometheus metrics and configure resource limits.
 
-Firecracker is an open source virtualization technology that is purpose-built
-for creating and managing secure, multi-tenant container and function-based
-services that provide serverless operational models. Firecracker runs workloads
-in lightweight virtual machines, called microVMs, which combine the security and
-isolation properties provided by hardware virtualization technology with the
-speed and flexibility of containers.
+## Requirements
 
-## Overview
+You need an Apple Silicon Mac running **macOS 26 or later**, with
+Hypervisor.framework available. Local validation has been performed on an M5;
+other Mac models and OS builds are not yet qualified.
 
-The main component of Firecracker is a virtual machine monitor (VMM) that uses
-the Linux Kernel Virtual Machine (KVM) to create and run microVMs. Firecracker
-has a minimalist design. It excludes unnecessary devices and guest-facing
-functionality to reduce the memory footprint and attack surface area of each
-microVM. This improves security, decreases the startup time, and increases
-hardware utilization. Firecracker has also been integrated in container
-runtimes, for example
-[Kata Containers](https://github.com/kata-containers/kata-containers) and
-[Flintlock](https://github.com/liquidmetal-dev/flintlock).
+For a source build, install Xcode Command Line Tools, Python 3, and Rust 1.97.0
+through rustup. Native dependencies are built in a private directory from
+checksum-pinned sources. Go and guest-image tools are downloaded and verified by
+the Linux fixture builder. No QEMU or sibling project is required.
 
-Firecracker was developed at Amazon Web Services to accelerate the speed and
-efficiency of services like [AWS Lambda](https://aws.amazon.com/lambda/) and
-[AWS Fargate](https://aws.amazon.com/fargate/). Firecracker is open sourced
-under [Apache version 2.0](LICENSE).
+## Quick Start
 
-To read more about Firecracker, check out
-[firecracker-microvm.io](https://firecracker-microvm.github.io).
+```sh
+git clone https://github.com/AitorConS/firecracker-macos.git
+cd firecracker-macos
+rustup toolchain install 1.97.0 --profile minimal --component clippy
 
-## Getting Started
+python3 experiments/hvf/distribution/build-native-deps.py
+export GLIB_PREFIX="$PWD/experiments/hvf/build/distribution/native"
+sh experiments/hvf/build-native.sh
 
-To get started with Firecracker, download the latest
-[release](https://github.com/firecracker-microvm/firecracker/releases) binaries
-or build it from source.
-
-You can build Firecracker on any Unix/Linux system that has Docker running (we
-use a development container) and `bash` installed, as follows:
-
-```bash
-git clone https://github.com/firecracker-microvm/firecracker
-cd firecracker
-tools/devtool build
-toolchain="$(uname -m)-unknown-linux-musl"
+python3 experiments/hvf/guests/linux/prepare.py
+build/macos-arm64/firecracker --no-api --config-file build/linux-guest/config.json
 ```
 
-The Firecracker binary will be placed at
-`build/cargo_target/${toolchain}/debug/firecracker`. For more information on
-building, testing, and running Firecracker, go to the
-[quickstart guide](docs/getting-started.md).
+The example boots Alpine Linux with a persistent test disk and a small HTTP/UDP
+service. In another terminal:
 
-The overall security of Firecracker microVMs, including the ability to meet the
-criteria for safe multi-tenant computing, depends on a well configured Linux
-host operating system. A configuration that we believe meets this bar is
-included in [the production host setup document](docs/prod-host-setup.md).
+```sh
+curl http://127.0.0.1:19000/
+curl http://127.0.0.1:19000/shutdown
+```
 
-## Contributing
+The build signs the executable ad hoc with the Hypervisor entitlement. It does
+not install a service or require administrator privileges. Guest preparation
+downloads public, checksum-verified assets and preserves an existing test disk.
 
-Firecracker is already running production workloads within AWS, but it's still
-Day 1 on the journey guided by our [mission](CHARTER.md). There's a lot more to
-build and we welcome all contributions.
+## Bring Your Own Guest
 
-To contribute to Firecracker, check out the development setup section in the
-[getting started guide](docs/getting-started.md) and then the Firecracker
-[contribution guidelines](CONTRIBUTING.md).
+Use `--no-api --config-file CONFIG.json` to run a configured VM, or start the
+API server in a private directory:
 
-## Releases
+```sh
+mkdir -m 700 vm-runtime
+build/macos-arm64/firecracker --api-sock "$PWD/vm-runtime/firecracker.sock"
+```
 
-New Firecracker versions are released via the GitHub repository
-[releases](https://github.com/firecracker-microvm/firecracker/releases) page,
-typically every two or three months. A history of changes is recorded in our
-[changelog](CHANGELOG.md).
+See the [macOS guide](experiments/hvf/README.md) for complete configuration,
+boot protocols, API endpoints, shutdown behavior, security, and snapshots.
+The API's `/capabilities` endpoint reports what this backend supports.
 
-The Firecracker release policy is detailed [here](docs/RELEASE_POLICY.md).
+## Tests
 
-## Design
+```sh
+brew install llvm
+export GLIB_PREFIX="$PWD/experiments/hvf/build/distribution/native"
+sh experiments/hvf/ci/hosted.sh       # Build, Rust tests, lint, device fault tests
+sh experiments/hvf/test-native.sh    # Real HVF, API, devices, security, Linux boot
+```
 
-Firecracker's overall architecture is described in
-[the design document](docs/design.md).
+The second command requires working hardware virtualization and LLVM for the
+sanitizer tests (`FUZZ_CC` can select its clang executable).
+Automatic CI runs on pushes and pull requests. Real HVF/KVM integration runs
+are separate, manually dispatched jobs on dedicated hosts. See the
+[CI guide](experiments/hvf/ci/README.md) for setup and coverage.
 
-## Features & Capabilities
+## Scope and Safety
 
-Firecracker consists of a single micro Virtual Machine Manager process that
-exposes an API endpoint to the host once started. The API is
-[specified in OpenAPI format](src/firecracker/swagger/firecracker.yaml). Read
-more about it in the [API docs](docs/api_requests).
+Network egress and DNS are denied by default; authorize only the destinations
+your guest needs. The macOS backend has its own API, Seatbelt policies, and
+resource limits: upstream Linux security guarantees and full API compatibility
+do not automatically apply.
 
-The **API endpoint** can be used to:
+Snapshots require the same Mac, macOS build, and VMM build. They are not a
+cross-machine migration format. Unix-stream restore requires a compatible
+interface and an explicitly authorized current switch socket; external switch
+state and live connections are not restored. Forced termination is not a clean
+guest shutdown.
 
-- Configure the microvm by:
-  - Setting the number of vCPUs (the default is 1).
-  - Setting the memory size (the default is 128 MiB).
-  - Configuring a [CPU template](docs/cpu_templates/cpu-templates.md).
-- Add one or more network interfaces to the microVM.
-- Add one or more read-write or read-only disks to the microVM, each represented
-  by a file-backed block device.
-- Trigger a block device re-scan while the guest is running. This enables the
-  guest OS to pick up size changes to the block device's backing file.
-- Change the backing file for a block device, before or after the guest boots.
-- Configure rate limiters for virtio devices which can limit the bandwidth,
-  operations per second, or both.
-- Configure the logging and metric system.
-- `[BETA]` Configure the data tree of the guest-facing metadata service. The
-  service is only available to the guest if this resource is configured.
-- Add a [vsock socket](docs/vsock.md) to the microVM.
-- Add a [entropy device](docs/entropy.md) to the microVM.
-- Add a [pmem device](docs/pmem.md) to the microVM.
-- Configure and manage [memory hotplugging](docs/memory-hotplug.md).
-- `[Developer Preview]` [Hot-plug and hot-unplug](docs/device-hotplug.md) virtio
-  PCI devices while the VM is running.
-- Start the microVM using a given kernel image, root file system, and boot
-  arguments.
-- [x86_64 only] Stop the microVM.
+This fork is intended for local development and experimentation. Public signed
+distribution, broader hardware qualification, a full 24-hour stability campaign,
+and physical power-loss certification remain outside the current validation.
 
-**Built-in Capabilities**:
+## Documentation
 
-- Demand fault paging and CPU oversubscription enabled by default.
-- Advanced, thread-specific seccomp filters for enhanced security.
-- [Jailer](docs/jailer.md) process for starting Firecracker in production
-  scenarios; applies a cgroup/namespace isolation barrier and then drops
-  privileges.
+- [macOS configuration and API](experiments/hvf/README.md)
+- [Unix-stream networking](experiments/hvf/UNIX_STREAM.md)
+- [Network regression tests](experiments/hvf/NETWORK_REGRESSIONS.md)
+- [Packaging and optional notarization](experiments/hvf/distribution/README.md)
+- [Storage durability and test boundaries](experiments/hvf/durability/README.md)
+- [Fuzzing](experiments/hvf/fuzz/README.md)
+- [Linux/KVM quick start](docs/getting-started.md)
 
-## Tested platforms
+## Contributing and License
 
-We test all combinations of:
+Bug reports and focused pull requests are welcome. Include your Mac model,
+macOS build, build revision, a minimal configuration, and reproduction steps;
+remove credentials and private guest data before sharing logs.
 
-| Instance                                    | Host OS & Kernel  | Guest Rootfs | Guest Kernel |
-| :------------------------------------------ | :---------------- | :----------- | :----------- |
-| m5n.metal (Intel Cascade Lake)              | al2 linux_5.10    | ubuntu 24.04 | linux_5.10   |
-| m6i.metal (Intel Ice Lake)                  | al2023 linux_6.1  |              | linux_6.1    |
-|                                             | al2023 linux_6.18 |              |              |
-| m7i.metal-24xl (Intel Sapphire Rapids)      |                   |              |              |
-| m7i.metal-48xl (Intel Sapphire Rapids)      |                   |              |              |
-| **m8i.metal-48xl (Intel Granite Rapids)\*** |                   |              |              |
-| **m8i.metal-96xl (Intel Granite Rapids)\*** |                   |              |              |
-| m6a.metal (AMD Milan)                       |                   |              |              |
-| m7a.metal-48xl (AMD Genoa)                  |                   |              |              |
-| m6g.metal (Graviton 2)                      |                   |              |              |
-| m7g.metal (Graviton 3)                      |                   |              |              |
-| m8g.metal-24xl (Graviton 4)                 |                   |              |              |
-| m8g.metal-48xl (Graviton 4)                 |                   |              |              |
-| m9g.metal-48xl (Graviton 5)                 |                   |              |              |
-
-**\***: We **only** support AWS EC2 8th Gen Intel (\*8i) instances using a 6.1
-or 6.18 host kernel. This is due to poor kernel support for Granite Rapids CPUs
-on 5.10.
-
-## Known issues and Limitations
-
-- The `pl031` RTC device on aarch64 does not support interrupts, so guest
-  programs which use an RTC alarm (e.g. `hwclock`) will not work.
-
-## Performance
-
-Firecracker's performance characteristics are listed as part of the
-[specification documentation](SPECIFICATION.md). All specifications are a part
-of our commitment to supporting container and function workloads in serverless
-operational models, and are therefore enforced via continuous integration
-testing.
-
-## Policy for Security Disclosures
-
-The security of Firecracker is our top priority. If you suspect you have
-uncovered a vulnerability, contact us privately, as outlined in our
-[security policy document](SECURITY.md); we will immediately prioritize your
-disclosure.
-
-## FAQ & Contact
-
-Frequently asked questions are collected in our [FAQ doc](FAQ.md).
-
-You can get in touch with the Firecracker community in the following ways:
-
-- Security-related issues, see our [security policy document](SECURITY.md).
-- Chat with us on our
-  [Slack workspace](https://join.slack.com/t/firecracker-microvm/shared_invite/zt-3v81btcpe-usCf8Qk7k1gUlSAEKKdYMg)
-  _Note: most of the maintainers are on a European time zone._
-- Open a GitHub issue in this repository.
-- Email the maintainers at
-  [firecracker-maintainers@amazon.com](mailto:firecracker-maintainers@amazon.com).
-
-When communicating within the Firecracker community, please mind our
-[code of conduct](CODE_OF_CONDUCT.md).
+This fork builds on the work of the Firecracker contributors. It retains the
+[Apache-2.0 license](LICENSE), [NOTICE](NOTICE), and third-party license notices.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the inherited contribution guidelines.

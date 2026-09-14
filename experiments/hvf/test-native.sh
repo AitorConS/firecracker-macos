@@ -15,6 +15,13 @@ cargo clippy -p hvf-vmm -p firecracker --target aarch64-apple-darwin -- -D warni
 experiments/hvf/build.sh
 python3 -m unittest discover -s experiments/hvf -v
 sh experiments/hvf/test-devices.sh
+sh experiments/hvf/test-security.sh
+sh experiments/hvf/test-network-stream.sh
+inherited_evidence=$(mktemp -d "$root/experiments/hvf/build/security-inherited.XXXXXX")
+python3 experiments/hvf/test-security-inherited.py --output "$inherited_evidence"
+races_evidence=$(mktemp -d "$root/experiments/hvf/build/security-races.XXXXXX")
+python3 experiments/hvf/test-security-races.py --source-dir src/hvf-vmm/src --output "$races_evidence"
+sh experiments/hvf/test-device-faults.sh
 if [ "${1:-}" != "--unit-only" ]; then
     python3 experiments/hvf/guests/linux/prepare.py
     python3 experiments/hvf/test-linux.py

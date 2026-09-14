@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{Drive, Result};
 use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 fn lock(file: &File, readonly: bool) -> Result<()> {
     let mode = if readonly {
         libc::LOCK_SH
@@ -20,14 +22,28 @@ fn lock(file: &File, readonly: bool) -> Result<()> {
     Ok(())
 }
 pub(super) fn open(drive: &Drive, copy: &Path) -> Result<File> {
-    let mut source = OpenOptions::new()
-        .read(true)
-        .write(!drive.copy_on_start && !drive.is_read_only)
-        .open(&drive.path_on_host)?;
+    open_cancellable(drive, copy, None, u64::MAX)
+}
+pub(super) fn inherited(file: File, readonly: bool) -> Result<File> {
+    lock(&file, readonly)?;
+    Ok(file)
+}
+pub(super) fn open_cancellable(
+    drive: &Drive,
+    copy: &Path,
+    cancel: Option<&AtomicBool>,
+    maximum: u64,
+) -> Result<File> {
+    let writable = !drive.copy_on_start && !drive.is_read_only;
+    let mut source = crate::resources::open_regular(&drive.path_on_host, writable)?;
     lock(&source, drive.copy_on_start || drive.is_read_only)?;
     if !drive.copy_on_start {
         return Ok(source);
     }
+    if source.metadata()?.len() > maximum {
+        return Err("disk copy exceeds file size limit".into());
+    }
+    let mut total = 0u64;
     let mut target = OpenOptions::new()
         .create_new(true)
         .read(true)
@@ -35,7 +51,21 @@ pub(super) fn open(drive: &Drive, copy: &Path) -> Result<File> {
         .open(copy)?;
     // Copy from the very descriptor whose inode we locked. Keep the source lock
     // throughout copying, including failures; never reopen the path for copying.
-    std::io::copy(&mut source, &mut target)?;
+    let mut buffer = vec![0u8; 128 << 10];
+    loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err("disk copy cancelled".into());
+        }
+        let n = source.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        total = total.checked_add(n as u64).ok_or("disk copy overflow")?;
+        if total > maximum {
+            return Err("disk copy grew beyond size limit".into());
+        }
+        target.write_all(&buffer[..n])?;
+    }
     target.sync_all()?;
     lock(&target, drive.is_read_only)?;
     Ok(target)

@@ -1,0 +1,33 @@
+name: Firecracker CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firecracker-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS ARM64 build and tests
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal --component clippy
+      - name: Install LLVM with LeakSanitizer support
+        run: brew install llvm
+      - name: Build pinned native dependencies
+        run: python3 experiments/hvf/distribution/build-native-deps.py
+      - name: Build, test, lint, and inject storage faults
+        env:
+          GLIB_PREFIX: ${{ github.workspace }}/experiments/hvf/build/distribution/native
+        run: sh experiments/hvf/ci/hosted.sh

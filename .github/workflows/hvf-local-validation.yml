@@ -1,0 +1,30 @@
+name: Manual HVF and KVM validation
+on:
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: Provisioned dedicated runner backend
+        type: choice
+        required: true
+        options: [hvf, kvm]
+permissions:
+  contents: read
+jobs:
+  hvf:
+    if: inputs.backend == 'hvf'
+    runs-on: [self-hosted, macOS, ARM64, hvf-macos26]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: sh experiments/hvf/ci/hvf.sh
+  kvm:
+    if: inputs.backend == 'kvm'
+    runs-on: [self-hosted, Linux, X64, kvm-validation]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: sh experiments/hvf/ci/kvm.sh

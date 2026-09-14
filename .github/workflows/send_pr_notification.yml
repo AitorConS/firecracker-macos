@@ -9,6 +9,7 @@ permissions: {}
 
 jobs:
   send_notification:
+    if: github.repository == 'firecracker-microvm/firecracker'
     runs-on: ubuntu-latest
     steps:
       - name: notify

@@ -3,9 +3,11 @@
 """Build a generic Linux test guest from pinned Alpine netboot assets and Go."""
 import argparse,gzip,hashlib,json,os,shutil,stat,struct,subprocess,tempfile,urllib.request,zlib
 from pathlib import Path
+import guest_tools
 HERE=Path(__file__).resolve().parent
 ROOT=HERE.parents[3]
 def prepare(work,go):
+    go=guest_tools.compiler(go);extractors={name:guest_tools.extractor(name) for name in ['bsdtar','unsquashfs']}
     work.mkdir(parents=True,exist_ok=True)
     manifest=json.loads((HERE/'assets.json').read_text())
     for name,asset in manifest.items():
@@ -26,11 +28,11 @@ def prepare(work,go):
     (work/'Image').write_bytes(kernel)
     with tempfile.TemporaryDirectory(prefix='linux-root-',dir=work) as td:
         tree=Path(td)
-        subprocess.run(['bsdtar','-xf',str(work/'initramfs-virt'),'-C',str(tree)],check=True)
+        subprocess.run([extractors['bsdtar'],'-xf',str(work/'initramfs-virt'),'-C',str(tree)],check=True)
         modules=tree/'extra-modules'
-        subprocess.run([os.environ.get('UNSQUASHFS','unsquashfs'),'-no-progress','-d',str(modules),str(work/'modloop-virt'),'modules/*/kernel/drivers/input/evdev.ko'],check=True,stdout=subprocess.DEVNULL)
+        subprocess.run([extractors['unsquashfs'],'-no-progress','-d',str(modules),str(work/'modloop-virt'),'modules/*/kernel/drivers/input/evdev.ko'],check=True,stdout=subprocess.DEVNULL)
         evdev=next(modules.rglob('evdev.ko'));shutil.copyfile(evdev,tree/'evdev.ko');shutil.rmtree(modules)
-        subprocess.run([go,'build' ,'-trimpath','-buildvcs=false','-o',str(tree/'vmm-test'),str(HERE/'main.go')],env={**os.environ,'GOOS':'linux','GOARCH':'arm64','CGO_ENABLED':'0'},check=True)
+        subprocess.run([go,'build' ,'-trimpath','-buildvcs=false','-o',str(tree/'vmm-test'),str(HERE/'main.go')],env={**os.environ,'GOOS':'linux','GOARCH':'arm64','CGO_ENABLED':'0','GOTOOLCHAIN':'local','GOARM64':'v8.0'},check=True)
         shutil.copyfile(HERE/'init',tree/'init');(tree/'init').chmod(0o755)
         names=['.']
         for base,dirs,files in os.walk(tree):
@@ -55,11 +57,13 @@ def prepare(work,go):
     if not disk.exists():
         with disk.open('wb') as f:f.truncate(64<<20);f.write(b'HVF_GENERIC_BLOCK_V1')
     config={'boot-source':{'kernel_image_path':str(work/'Image'),'boot_protocol':'linux-image','initrd_path':str(work/'test-initrd.gz'),'boot_args':'console=ttyAMA0 rdinit=/init panic=-1'},'machine-config':{'vcpu_count':4,'mem_size_mib':256,'power_button':True},'drives':[{'drive_id':'disk0','path_on_host':str(disk)}],'network-interfaces':[{'iface_id':'eth0','guest_mac':'02:12:34:56:78:90','backend':'slirp','forwards':[{'protocol':'tcp','host_addr':'127.0.0.1','host_port':19000,'guest_addr':'10.0.2.15','guest_port':9000},{'protocol':'udp','host_addr':'127.0.0.1','host_port':19001,'guest_addr':'10.0.2.15','guest_port':9001}]}]}
+    config['security']={'version':1,'listeners':[{'protocol':f['protocol'],'address':f['host_addr'],'port':f['host_port']} for f in config['network-interfaces'][0]['forwards']]}
     (work/'config.json').write_text(json.dumps(config,indent=2)+'\n')
+    guest_tools.provenance(work,go,extractors)
     return config
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',type=Path,default=ROOT/'build/linux-guest')
-    parser.add_argument('--go',default=os.environ.get('GO','go'))
+    parser.add_argument('--go',default=os.environ.get('GO'))
     args=parser.parse_args();prepare(args.output.resolve(),args.go)
     print(args.output.resolve()/'config.json')

@@ -44,7 +44,11 @@ int input_mmio(uint64_t addr,unsigned size,int write,uint64_t *v){
     }return 1;}
     switch(off){
         case 0x14:feature_sel=*v;break;case 0x24:driver_sel=*v;break;
-        case 0x20:if(driver_sel==1){if(*v&~1U)return 0;feature_hi=*v;}else if(*v)return 0;break;
+        /* Guests may echo transport-reserved feature bits in either word.
+         * Negotiate only VERSION_1 (high bit 0) and ignore unsupported bits;
+         * rejecting the MMIO access turns a normal feature negotiation into a
+         * fatal guest data abort before the driver can report FAILED status. */
+        case 0x20:if(driver_sel==1)feature_hi=*v&1U;break;
         case 0x30:qsel=*v;break;
         case 0x38:if(!q||q->ready||!*v||*v>MAXQ||(*v&(*v-1)))return 0;q->num=*v;break;
         case 0x44:if(!q||*v>1||(*v&&!q->num))return 0;q->ready=*v;break;
@@ -77,4 +81,13 @@ int input_power_button(void){
         uint8_t *used=dma(q->used+4+8*(q->done%q->num),8);put(used,4,heads[i]);put(used+4,4,8);q->done++;q->last++;
     }
     atomic_thread_fence(memory_order_release);put(dma(q->used+2,2),2,q->done);irqstatus|=1;irq();return 1;
+}
+
+void input_snapshot(struct snapshot_io *s){
+    SNAP(s,status);SNAP(s,irqstatus);SNAP(s,feature_sel);SNAP(s,driver_sel);SNAP(s,qsel);SNAP(s,feature_hi);
+    snapshot_bytes(s,config,sizeof(config));
+    for(unsigned i=0;i<2;i++){struct queue *q=&queues[i];
+        SNAP(s,q->desc);SNAP(s,q->avail);SNAP(s,q->used);SNAP(s,q->num);SNAP(s,q->ready);SNAP(s,q->last);SNAP(s,q->done);
+        if(q->num>MAXQ || q->ready>1 || (q->ready && (!q->num || (q->num&(q->num-1)))))s->error=1;
+    }
 }

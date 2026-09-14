@@ -1,0 +1,20 @@
+{
+  "go": {
+    "version": "go1.26.0",
+    "filename": "go1.26.0.darwin-arm64.tar.gz",
+    "url": "https://go.dev/dl/go1.26.0.darwin-arm64.tar.gz",
+    "sha256": "b1640525dfe68f066d56f200bef7bf4dce955a1a893bd061de6754c211431023"
+  },
+  "bsdtar": {
+    "version_prefix": "bsdtar 3.5.3 - libarchive 3.7.4",
+    "sha256": "f96200d5be4a3f99cdbc88892a2e26f14d501d354c72b224472462cc67fa271d",
+    "platform": "darwin-arm64",
+    "scope": "tested host executable; changing tool or SDK requires explicit lock update and fixture verification"
+  },
+  "unsquashfs": {
+    "version_prefix": "unsquashfs version 4.7.5 (2026/03/01)",
+    "sha256": "90b8aeac6733d0fb34c18cd000c1916b56cf58323d47338b82413c5eb7765d16",
+    "platform": "darwin-arm64",
+    "scope": "tested host executable; changing tool or SDK requires explicit lock update and fixture verification"
+  }
+}

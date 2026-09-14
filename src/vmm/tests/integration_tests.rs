@@ -7,6 +7,8 @@ use std::io::{Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+#[cfg(target_arch = "x86_64")]
+use std::time::Instant;
 
 use vmm::builder::build_and_boot_microvm;
 use vmm::devices::virtio::block::CacheType;
@@ -36,12 +38,28 @@ use vmm::vmm_config::vsock::VsockDeviceConfig;
 use vmm::{DumpCpuConfigError, EventManager, FcExitCode, Vmm};
 use vmm_sys_util::tempfile::TempFile;
 
+// stdin HUP and device events can wake the first poll before the exit event.
+// Keep the original total budget, and assert the actual terminal result below.
+#[cfg(target_arch = "x86_64")]
+fn wait_for_exit(vmm: &Arc<Mutex<Vmm>>, evmgr: &mut EventManager) {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while vmm.lock().unwrap().shutdown_exit_code().is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        evmgr
+            .run_with_timeout(i32::try_from(remaining.as_millis()).unwrap())
+            .unwrap();
+    }
+}
+
 #[allow(unused_mut, unused_variables)]
 fn check_booted_microvm(vmm: Arc<Mutex<Vmm>>, mut evmgr: EventManager) {
     // On x86_64, the vmm should exit once its workload completes and signals the exit event.
     // On aarch64, the test kernel doesn't exit, so the vmm is force-stopped.
     #[cfg(target_arch = "x86_64")]
-    evmgr.run_with_timeout(500).unwrap();
+    wait_for_exit(&vmm, &mut evmgr);
     #[cfg(target_arch = "aarch64")]
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 
@@ -86,7 +104,7 @@ fn check_build_microvm(vmm: Arc<Mutex<Vmm>>, mut evmgr: EventManager) {
     // On aarch64, the test kernel doesn't exit, so the vmm is force-stopped.
     vmm.lock().unwrap().resume_vm().unwrap();
     #[cfg(target_arch = "x86_64")]
-    evmgr.run_with_timeout(500).unwrap();
+    wait_for_exit(&vmm, &mut evmgr);
     #[cfg(target_arch = "aarch64")]
     vmm.lock().unwrap().stop(FcExitCode::Ok);
     assert_eq!(

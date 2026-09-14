@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "net.h"
+#include "budget.h"
+static struct budget network_budget;
 #include <Hypervisor/Hypervisor.h>
 #include "net_backend.h"
 #include <poll.h>
+#include <errno.h>
+#include <sys/mman.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +25,7 @@ static uint16_t selectq;
 struct queue {uint32_t pfn;uint16_t avail,used;};
 static struct queue queues[2];
 static unsigned long rx,tx;
+static uint64_t rx_bytes,tx_bytes,drop_packets,drop_bytes;
 static uint8_t mac[6];
 static void die(const char *why) {fprintf(stderr,"net error: %s\n",why);exit(2);}
 static uint64_t get(const void *p,unsigned n){uint64_t v=0;memcpy(&v,p,n);return v;}
@@ -34,13 +39,14 @@ static struct desc desc(struct queue *q,uint16_t i){
     if(d.flags&~3U)die("descriptor flags");dma(d.addr,d.len);return d;
 }
 static uint64_t avail_addr(struct queue *q){return ((uint64_t)q->pfn<<12)+16*QSZ;}
-static int pending(struct queue *q){
+static unsigned queued(struct queue *q){
     if(!q->pfn||!(status&4))return 0;
     uint16_t n=get(dma(avail_addr(q)+2,2),2);
     atomic_thread_fence(memory_order_acquire);
     if((uint16_t)(n-q->avail)>QSZ)die("ring overrun");
-    return n!=q->avail;
+    return (uint16_t)(n-q->avail);
 }
+static int pending(struct queue *q){return queued(q)!=0;}
 static uint16_t head(struct queue *q){return get(dma(avail_addr(q)+4+2*(q->avail%QSZ),2),2);}
 static void complete(struct queue *q,uint16_t h,uint32_t n){
     uint64_t used=(avail_addr(q)+4+2*QSZ+2+4095)&~4095ULL;
@@ -51,8 +57,9 @@ static void complete(struct queue *q,uint16_t h,uint32_t n){
 static ssize_t receive(const void *buf,size_t len,void *opaque){
     (void)opaque;
     struct queue *q=&queues[0];
-    if(!pending(q))return len; // allow protocol retransmission when RX ring is empty
+    if(!pending(q)){drop_packets++;drop_bytes+=len;return len;} // allow protocol retransmission when RX ring is empty
     if(len>65536-10)die("oversized frame");
+    if(!budget_take(&network_budget,len,1)){errno=EAGAIN;return -1;}
     uint8_t frame[65536]={0};memcpy(frame+10,buf,len);size_t total=len+10,done=0;
     uint16_t h=head(q),i=h;unsigned count=0;
     while(done<total){
@@ -62,7 +69,7 @@ static ssize_t receive(const void *buf,size_t len,void *opaque){
         memcpy(dma(d.addr,n),frame+done,n);done+=n;
         if(done<total && !(d.flags&1))die("RX buffer too small");i=d.next;
     }
-    complete(q,h,total);rx++;return len;
+    complete(q,h,total);rx++;rx_bytes+=len;return len;
 }
 static void transmit(void){
     struct queue *q=&queues[1];
@@ -75,18 +82,21 @@ static void transmit(void){
             if(!(d.flags&1))break;i=d.next;
         }
         if(len<24 || frame[0] || frame[1])die("TX header/offload unsupported");
-        complete(q,h,0);net_backend_send(frame+10,len-10);tx++;
+        if(!budget_take(&network_budget,len-10,1))break;
+        complete(q,h,0);net_backend_send(frame+10,len-10);tx++;tx_bytes+=len-10;
     }
 }
 int net_init(void *memory,size_t size,const struct hvf_options *options){
+    budget_init(&network_budget,options->network_bytes_per_second,options->network_packets_per_second,256ULL<<10,256);
     memset(cfg,0,sizeof(cfg));memset(queues,0,sizeof(queues));
     status=isr=features=selectq=rx=tx=0;bar=BAR;
+    rx_bytes=tx_bytes=drop_packets=drop_bytes=0;
     ram=memory;ram_size=size;enabled=options->network_enabled;if(!enabled)return 0;
     memcpy(mac,options->mac,6);
     if(net_backend_open(options,receive))return -1;
     put(cfg,2,0x1af4);put(cfg+2,2,0x1000);cfg[0xb]=2;
     put(cfg+0x10,4,BAR);put(cfg+0x2c,2,0x1af4);put(cfg+0x2e,2,1);cfg[0x3d]=1;
-    fprintf(stderr,"network: slirp enabled, %u forwarding rules\n",options->forward_count);return 0;
+    fprintf(stderr,"network: %s enabled, %u forwarding rules\n",options->stream_path?"unix-stream":"slirp",options->forward_count);return 0;
 }
 int net_mmio(uint64_t addr,unsigned size,int write,uint64_t *v){
     if(!enabled)return 0;
@@ -115,5 +125,23 @@ int net_mmio(uint64_t addr,unsigned size,int write,uint64_t *v){
         default:{if(off<20||off+size>26)return 0;*v=get(mac+(off-20),size);}
     }}return 1;
 }
+int net_pending_tx(void){return enabled && pending(&queues[1]);}
 void net_poll(void){if(enabled){transmit();net_backend_poll();}}
 void net_close(void){if(enabled){fprintf(stderr,"network: TX=%lu RX=%lu\n",tx,rx);net_backend_close();enabled=0;}}
+
+// Caller holds the device I/O lock. RX drops count empty rings; rate limiting defers one bounded IPC frame.
+void net_metrics(uint64_t out[6]) {
+    out[0]=tx;out[1]=rx;out[2]=tx_bytes;out[3]=rx_bytes;
+    out[4]=drop_packets;out[5]=drop_bytes;
+}
+
+// Called only in the freshly forked transport process, before parsing packets.
+int net_forget_guest_memory(void){if(ram && munmap(ram,ram_size))return -1;ram=NULL;ram_size=0;return 0;}
+
+void net_snapshot(struct snapshot_io *s){
+    snapshot_bytes(s,cfg,sizeof(cfg));SNAP(s,status);SNAP(s,isr);SNAP(s,bar);SNAP(s,features);SNAP(s,selectq);
+    for(unsigned i=0;i<2;i++){SNAP(s,queues[i].pfn);SNAP(s,queues[i].avail);SNAP(s,queues[i].used);}
+    SNAP(s,rx);SNAP(s,tx);SNAP(s,rx_bytes);SNAP(s,tx_bytes);SNAP(s,drop_packets);SNAP(s,drop_bytes);
+}
+
+void net_queue_depths(uint64_t out[2]){out[0]=enabled?queued(&queues[1]):0;out[1]=enabled?queued(&queues[0]):0;}

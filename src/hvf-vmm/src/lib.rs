@@ -11,7 +11,12 @@ use std::process::ExitCode;
 
 mod api;
 mod block;
+mod inherited;
+mod limits;
 mod loader;
+mod resources;
+mod security;
+mod snapshot;
 mod tree;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -40,6 +45,10 @@ pub struct Config {
     network_interfaces: Vec<Network>,
     #[serde(default)]
     hvf: Options,
+    #[serde(default)]
+    security: Option<security::Security>,
+    #[serde(default)]
+    limits: limits::Limits,
 }
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -63,6 +72,8 @@ struct Network {
     iface_id: String,
     guest_mac: String,
     backend: String,
+    #[serde(default)]
+    socket_path: Option<PathBuf>,
     #[serde(default)]
     forwards: Vec<Forward>,
 }
@@ -141,6 +152,13 @@ struct Options {
 }
 impl Config {
     fn validate(&self) -> Result<()> {
+        self.validate_shape()?;
+        self.validate_files()
+    }
+    fn validate_shape(&self) -> Result<()> {
+        let security = self.security.as_ref().ok_or("SECURITY_MIGRATION_REQUIRED: add security version 1; use --migrate-config to inspect required permissions")?;
+        security.validate()?;
+        self.limits.validate()?;
         if !(1..=4).contains(&self.machine_config.vcpu_count)
             || !(64..=2048).contains(&self.machine_config.mem_size_mib)
             || self.machine_config.smt
@@ -172,12 +190,46 @@ impl Config {
             return Err("at most one network interface".into());
         }
         for net in &self.network_interfaces {
-            if net.iface_id.is_empty() || net.backend != "slirp" || net.forwards.len() > 64 {
+            if net.iface_id.is_empty()
+                || !["slirp", "unix-stream"].contains(&net.backend.as_str())
+                || net.forwards.len() > 64
+            {
                 return Err("invalid network interface or backend".into());
+            }
+            if net.backend == "unix-stream" {
+                let path = net
+                    .socket_path
+                    .as_ref()
+                    .ok_or("unix-stream requires socket_path")?;
+                let value = path.to_str().ok_or("socket_path must be UTF-8")?;
+                if !path.is_absolute()
+                    || value.len() >= 104
+                    || value.chars().any(char::is_control)
+                    || path
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return Err("invalid Unix stream socket path".into());
+                }
+                if security.unix_stream.as_ref() != Some(path)
+                    || !net.forwards.is_empty()
+                    || !security.egress.is_empty()
+                    || !security.listeners.is_empty()
+                    || security.dns.is_some()
+                {
+                    return Err("unix-stream requires matching security.unix_stream; IP policy and forwards belong to the external switch".into());
+                }
+            } else if net.socket_path.is_some() || security.unix_stream.is_some() {
+                return Err("socket_path/security.unix_stream require unix-stream backend".into());
             }
             mac_bytes(&net.guest_mac)?;
             let mut bindings = std::collections::BTreeSet::new();
             for f in &net.forwards {
+                if !security.permits_listener(&f.protocol, f.host_addr, f.host_port) {
+                    return Err(
+                        "forwarding listener is not authorized by security.listeners".into(),
+                    );
+                }
                 if !["tcp", "udp"].contains(&f.protocol.as_str())
                     || f.host_port == 0
                     || f.guest_port == 0
@@ -193,6 +245,9 @@ impl Config {
                 return Err("drive IDs must be unique and nonempty".into());
             }
         }
+        Ok(())
+    }
+    fn validate_files(&self) -> Result<()> {
         for path in self.firmware.values() {
             let m = fs::metadata(path)?;
             if !m.is_file() || m.len() > 65536 {
@@ -258,6 +313,15 @@ struct NativeOptions {
     drives: *const NativeDrive,
     firmware: *const NativeFirmware,
     forwards: *const NativeForward,
+    security: *const security::NativeSecurity,
+    snapshot_dir: *const std::ffi::c_char,
+    stream_path: *const std::ffi::c_char,
+    restore: u32,
+    cpu_seconds: u64,
+    disk_bytes_per_second: u64,
+    disk_operations_per_second: u64,
+    network_bytes_per_second: u64,
+    network_packets_per_second: u64,
 }
 unsafe extern "C" {
     fn hvf_run(
@@ -270,6 +334,7 @@ unsafe extern "C" {
 
 fn run(config: Config) -> Result<i32> {
     config.validate()?;
+    config.limits.apply()?;
     let work = tempfile::tempdir()?;
     PRIVATE_DIRECTORY
         .set(work.path().to_path_buf())
@@ -314,11 +379,34 @@ fn run(config: Config) -> Result<i32> {
         .chain(config.drives.iter().filter(|d| !d.is_root_device))
         .collect();
     use std::os::fd::AsRawFd;
-    let files: Vec<File> = ordered
-        .iter()
-        .enumerate()
-        .map(|(i, d)| block::open(d, &work.path().join(format!("disk-{i}.img"))))
-        .collect::<Result<_>>()?;
+    let files: Vec<File> = if let Ok(inherited) = std::env::var("HVF_DRIVE_FDS") {
+        use std::os::fd::FromRawFd;
+        let fds: Vec<i32> = if inherited.is_empty() {
+            Vec::new()
+        } else {
+            inherited
+                .split(',')
+                .map(str::parse)
+                .collect::<std::result::Result<_, _>>()?
+        };
+        let unique: std::collections::BTreeSet<_> = fds.iter().copied().collect();
+        if fds.len() != ordered.len() || unique.len() != fds.len() || fds.iter().any(|&fd| fd < 3) {
+            return Err("invalid supervisor drive descriptors".into());
+        }
+        fds.into_iter()
+            .zip(&ordered)
+            .map(|(fd, drive)| {
+                // SAFETY: private supervisor handoff; each inherited fd is adopted once.
+                block::inherited(unsafe { File::from_raw_fd(fd) }, drive.is_read_only)
+            })
+            .collect::<Result<_>>()?
+    } else {
+        ordered
+            .iter()
+            .enumerate()
+            .map(|(i, d)| block::open(d, &work.path().join(format!("disk-{i}.img"))))
+            .collect::<Result<_>>()?
+    };
     let drives: Vec<_> = files
         .iter()
         .zip(&ordered)
@@ -354,6 +442,14 @@ fn run(config: Config) -> Result<i32> {
         })
         .collect();
     let net = config.network_interfaces.first();
+    let stream_path = net
+        .and_then(|n| n.socket_path.as_ref())
+        .map(|p| -> Result<CString> {
+            let path = fs::canonicalize(p.parent().ok_or("missing socket parent")?)?
+                .join(p.file_name().ok_or("missing socket name")?);
+            Ok(CString::new(path.as_os_str().as_bytes())?)
+        })
+        .transpose()?;
     let forwards: Vec<_> = net
         .into_iter()
         .flat_map(|n| &n.forwards)
@@ -365,6 +461,18 @@ fn run(config: Config) -> Result<i32> {
             guest_port: f.guest_port,
         })
         .collect();
+    let snapshot_directory = std::env::var_os("HVF_SNAPSHOT_DIR")
+        .map(PathBuf::from)
+        .ok_or("missing supervised snapshot directory")?;
+    let private_root = snapshot_directory
+        .parent()
+        .ok_or("missing private VM directory")?;
+    let snapshot_dir = CString::new(snapshot_directory.as_os_str().as_bytes())?;
+    let policy = security::Policy::new(
+        config.security.as_ref().unwrap(),
+        private_root,
+        &config.drives,
+    )?;
     let ram_path = CString::new(ram_path.as_os_str().as_bytes())?;
     let native = NativeOptions {
         cpus: config.machine_config.vcpu_count,
@@ -387,6 +495,17 @@ fn run(config: Config) -> Result<i32> {
         drives: drives.as_ptr(),
         firmware: firmware.as_ptr(),
         forwards: forwards.as_ptr(),
+        security: &policy.native,
+        snapshot_dir: snapshot_dir.as_ptr(),
+        stream_path: stream_path
+            .as_ref()
+            .map_or(std::ptr::null(), |p| p.as_ptr()),
+        restore: (std::env::var("HVF_RESTORE").as_deref() == Ok("1")).into(),
+        cpu_seconds: config.limits.cpu_seconds,
+        disk_bytes_per_second: config.limits.disk_bytes_per_second,
+        disk_operations_per_second: config.limits.disk_operations_per_second,
+        network_bytes_per_second: config.limits.network_bytes_per_second,
+        network_packets_per_second: config.limits.network_packets_per_second,
     };
     // SAFETY: C strings/options stay alive throughout this blocking call. The backend
     // owns and joins all vCPU threads before returning; only one VM is run per process.
@@ -407,8 +526,10 @@ fn entry(version: &str) -> Result<i32> {
     let mut args = std::env::args().skip(1);
     let mut config = None;
     let mut check = false;
+    let mut migrate = false;
     let mut socket = None;
     let mut no_api = false;
+    let mut child_mode = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--version" => {
@@ -417,15 +538,17 @@ fn entry(version: &str) -> Result<i32> {
             }
             "--help" => {
                 println!(
-                    "firecracker --no-api --config-file CONFIG [--check-config]\nfirecracker --api-sock SOCKET [--config-file CONFIG]\nExperimental macOS ARM64 backend; see experiments/hvf/README.md"
+                    "firecracker --no-api --config-file CONFIG [--check-config]\nfirecracker --api-sock SOCKET [--config-file CONFIG]\nfirecracker --migrate-config --config-file CONFIG\nExperimental macOS ARM64 backend; see experiments/hvf/README.md"
                 );
                 return Ok(0);
             }
             "--no-api" => no_api = true,
+            "--hvf-child" => child_mode = true,
             "--api-sock" => {
                 socket = Some(PathBuf::from(args.next().ok_or("missing api-sock value")?))
             }
             "--check-config" => check = true,
+            "--migrate-config" => migrate = true,
             "--config-file" => {
                 config = Some(PathBuf::from(
                     args.next().ok_or("missing config-file value")?,
@@ -437,7 +560,32 @@ fn entry(version: &str) -> Result<i32> {
     if no_api && socket.is_some() {
         return Err("--no-api conflicts with --api-sock".into());
     }
+    if child_mode {
+        if !no_api || check || migrate || socket.is_some() {
+            return Err("internal child requires only --no-api and --config-file".into());
+        }
+        inherited::restrict_child()?;
+    }
     let config = config.as_deref().map(read_config).transpose()?;
+    if migrate {
+        if check || socket.is_some() {
+            return Err("--migrate-config conflicts with --check-config and --api-sock".into());
+        }
+        let mut config = config.ok_or("--config-file is required")?;
+        if config.security.is_some() {
+            return Err("configuration already declares security".into());
+        }
+        config.security = Some(security::Security::default());
+        let listeners: Vec<_>=config.network_interfaces.iter().flat_map(|n| &n.forwards).map(|f| serde_json::json!({"protocol":f.protocol,"address":f.host_addr,"port":f.host_port})).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "configuration":config,"required_listener_permissions":listeners,
+                "review_required":"No listener, outbound or DNS permission has been granted. Add the required exact endpoints before starting; outbound requirements cannot be inferred from the configuration."
+            }))?
+        );
+        return Ok(0);
+    }
     if check {
         config
             .as_ref()
@@ -449,7 +597,15 @@ fn entry(version: &str) -> Result<i32> {
     if let Some(socket) = socket {
         return api::serve(&socket, config);
     }
-    run(config.ok_or("--config-file or --api-sock is required")?)
+    let config = config.ok_or("--config-file or --api-sock is required")?;
+    if child_mode {
+        if !no_api || std::env::var_os("HVF_READY_FD").is_none() {
+            return Err("internal child requires supervisor channel".into());
+        }
+        run(config)
+    } else {
+        api::headless(config)
+    }
 }
 /// Execute the Darwin CLI. Unsupported options and configurations fail explicitly.
 pub fn main_entry(version: &str) -> ExitCode {
@@ -459,5 +615,49 @@ pub fn main_entry(version: &str) -> ExitCode {
             eprintln!("HVF: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_config_tests {
+    use super::*;
+    fn config() -> Config {
+        serde_json::from_value(serde_json::json!({
+            "boot-source":{"kernel_image_path":"/unused"},
+            "network-interfaces":[{"iface_id":"eth0","guest_mac":"02:00:00:00:00:01","backend":"unix-stream","socket_path":"/private/tmp/link"}],
+            "security":{"version":1,"unix_stream":"/private/tmp/link"}
+        })).unwrap()
+    }
+    #[test]
+    fn stream_requires_explicit_matching_capability() {
+        let mut c = config();
+        c.validate_shape().unwrap();
+        c.security.as_mut().unwrap().unix_stream = None;
+        assert!(c.validate_shape().is_err());
+        c.security.as_mut().unwrap().unix_stream = Some("/other".into());
+        assert!(c.validate_shape().is_err());
+    }
+    #[test]
+    fn stream_rejects_ip_policy_and_invalid_paths() {
+        let mut c = config();
+        c.security.as_mut().unwrap().dns = Some(security::Resolver {
+            address: std::net::Ipv4Addr::LOCALHOST,
+            port: 53,
+        });
+        assert!(c.validate_shape().is_err());
+        for path in [
+            "relative",
+            "/tmp/../link",
+            "/tmp/\nlink",
+            &format!("/tmp/{}", "x".repeat(104)),
+        ] {
+            let mut c = config();
+            c.network_interfaces[0].socket_path = Some(path.into());
+            c.security.as_mut().unwrap().unix_stream = Some(path.into());
+            assert!(c.validate_shape().is_err());
+        }
+        let mut c = config();
+        c.network_interfaces[0].backend = "slirp".into();
+        assert!(c.validate_shape().is_err());
     }
 }

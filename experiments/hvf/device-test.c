@@ -12,6 +12,9 @@
 #define BAR 0x10000000ULL
 #define SIZE (1<<20)
 struct descriptor { uint64_t addr; uint32_t len; uint16_t flags,next; };
+static int witness=-1;
+static uint8_t original[512];
+static void unchanged(void){if(witness>=0){uint8_t data[512];assert(pread(witness,data,512,0)==512);assert(!memcmp(data,original,512));}}
 static void wr(uint64_t off,unsigned size,uint64_t v){assert(devices_mmio(BAR+off,size,1,&v));}
 int main(int argc,char **argv){
     assert(argc==2);const char *test=argv[1];
@@ -34,7 +37,8 @@ int main(int argc,char **argv){
     desc[1]=(struct descriptor){BASE+0x30000,512,3,2};
     desc[2]=(struct descriptor){BASE+0x40000,1,2,0};
     uint32_t *header=(void*)(ram+0x20000);
-    if(!strcmp(test,"write")||!strcmp(test,"readonly")){header[0]=1;desc[1].flags=1;memset(ram+0x30000,0xa5,512);}
+    if(!strcmp(test,"write")||!strcmp(test,"readonly")||!strcmp(test,"malformed-tail")){header[0]=1;desc[1].flags=1;memset(ram+0x30000,0xa5,512);}
+    if(!strcmp(test,"malformed-tail")){witness=fd;memcpy(original,pattern,512);assert(!atexit(unchanged));desc[2].len=2;}
     if(!strcmp(test,"oob"))desc[1].addr=BASE+SIZE-256;
     if(!strcmp(test,"cycle")){desc[1].next=1;}
     if(!strcmp(test,"short-header"))desc[0].len=15;

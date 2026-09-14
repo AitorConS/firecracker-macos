@@ -1168,6 +1168,7 @@ mod tests {
                     * 2,
         );
 
+        let original_khz = vcpu.get_tsc_khz().unwrap();
         if vm.kvm().fd.check_extension(Cap::TscControl) {
             vcpu.set_tsc_khz(state.tsc_khz.unwrap()).unwrap();
             if vm.kvm().fd.check_extension(Cap::GetTscKhz) {
@@ -1176,7 +1177,11 @@ mod tests {
                 vcpu.get_tsc_khz().unwrap_err();
             }
         } else {
-            vcpu.set_tsc_khz(state.tsc_khz.unwrap()).unwrap_err();
+            // KVM permits a faster TSC via software catchup even without scaling.
+            // A slower rate outside the tolerance still requires TscControl.
+            vcpu.set_tsc_khz(state.tsc_khz.unwrap()).unwrap();
+            assert_eq!(vcpu.get_tsc_khz().ok(), state.tsc_khz);
+            vcpu.set_tsc_khz(original_khz / 2).unwrap_err();
         }
     }
 

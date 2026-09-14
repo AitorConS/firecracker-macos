@@ -12,7 +12,7 @@ permissions:
 jobs:
   trigger_ab_test:
     runs-on: ubuntu-latest
-    if: ${{ github.event.forced == false }}
+    if: ${{ github.repository == 'firecracker-microvm/firecracker' && github.event.forced == false }}
     steps:
       - name: "Check out repository"
         uses: actions/checkout@v4

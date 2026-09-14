@@ -20,7 +20,7 @@ cp experiments/hvf/fuzz/corpus/* "$out/corpus/"
 python3 - <<'PY'
 from pathlib import Path
 p=Path('experiments/hvf/build/fuzz/corpus')
-for target in range(4):
+for target in range(5):
     for mode in range(4):
         (p/f'seed-{target}-{mode}').write_bytes(bytes([target,mode]))
 PY

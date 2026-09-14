@@ -26,6 +26,12 @@ func main(){
   reply,e:=io.ReadAll(response.Body);fail(e);response.Body.Close();if string(reply)!="outbound-ok"{panic("bad callback")};shutdown();return
  }}
  http.HandleFunc("/",func(w http.ResponseWriter,r *http.Request){json.NewEncoder(w).Encode(map[string]any{"kernel":strings.TrimSpace(string(kernel)),"arch":runtime.GOARCH,"cpus":runtime.NumCPU(),"count":n,"mac":strings.TrimSpace(string(mac))})})
+ http.HandleFunc("/disk",func(w http.ResponseWriter,r *http.Request){
+  f,e:=os.OpenFile("/dev/vda",os.O_RDWR,0);fail(e);defer f.Close()
+  if r.Method=="POST" {data,e:=io.ReadAll(io.LimitReader(r.Body,513));fail(e);if len(data)!=512{http.Error(w,"512 bytes required",400);return};_,e=f.WriteAt(data,4096);fail(e);fail(f.Sync())}
+  data:=make([]byte,512);_,e=f.ReadAt(data,4096);fail(e);w.Write(data)
+ })
+ http.HandleFunc("/clock",func(w http.ResponseWriter,r *http.Request){data,e:=os.ReadFile("/proc/uptime");fail(e);w.Write(data)})
  http.HandleFunc("/echo",func(w http.ResponseWriter,r *http.Request){io.Copy(w,r.Body)})
  http.HandleFunc("/shutdown",func(w http.ResponseWriter,r *http.Request){fmt.Fprint(w,"bye");go func(){time.Sleep(100*time.Millisecond);shutdown()}()})
  fmt.Println("LINUX_GENERIC_READY")

@@ -42,7 +42,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data,size_t size){
     struct hvf_options options={.drive_count=1,.drives=&drive,.firmware_count=1,.firmware=&fw,.network_enabled=1};
     assert(devices_init(ram,SIZE,NULL,&options)==0);assert(net_init(ram,SIZE,&options)==0);input_init(ram,SIZE,1);
     if(!setjmp(rejected)){
-        unsigned target=data[0]%4;
+        unsigned target=data[0]%5;
+        if(target==4){
+            struct snapshot_io input={.fd=-1,.restore=1,.input=data+2,.remaining=size-2};
+            devices_snapshot(&input);net_snapshot(&input);input_snapshot(&input);
+            (void)snapshot_end(&input);
+        }
         desc(0,BASE+0x20000,16,1,1);desc(1,BASE+0x30000,512,3,2);desc(2,BASE+0x40000,1,2,0);
         put(0x11002,2,1);
         if(target==1){desc(0,BASE+0x20000,64,(data[1]&2)?2:0,0);}

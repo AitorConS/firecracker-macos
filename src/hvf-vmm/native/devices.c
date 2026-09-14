@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Legacy VirtIO PCI block devices over opaque, pre-opened block files.
 #include "devices.h"
+#include "budget.h"
+static struct budget disk_budget;
 #include <Hypervisor/Hypervisor.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -11,6 +13,10 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <errno.h>
+#ifdef HVF_CRASH_JOURNAL
+// Test-only power-loss journal (experiments/hvf/durability); never in releases.
+#include "crash_journal.h"
+#endif
 #define BASE 0x40000000ULL
 #define BAR 0x10000000ULL
 #define ECAM 0x3f000000ULL
@@ -25,6 +31,9 @@ struct block {
     uint32_t bar, guest_features, pfn;
     uint16_t qsel, last_avail, used_idx;
     unsigned long requests;
+    uint64_t read_bytes,write_bytes,errors;
+    // First host write/flush errno. Once set, every later FLUSH fails.
+    int storage_errno;
 };
 static struct block blocks[4];
 static unsigned block_count;
@@ -55,6 +64,25 @@ static struct desc descriptor(struct block *block,uint16_t idx) {
     if(d.flags & ~3U) fail("unsupported descriptor flags");
     guest(d.addr,d.len); return d;
 }
+static int flush_disk(int fd) {
+    int result;
+    // Do not acknowledge a weaker fsync after a failed full flush. The guest
+    // must see unsupported filesystems and I/O failures as device errors.
+    do {
+        result = fcntl(fd, F_FULLFSYNC);
+    } while (result == -1 && errno == EINTR);
+    return result;
+}
+// A failed pwrite or F_FULLFSYNC may leave host pages dropped or unwritten,
+// and the Nanos TFS log clears its dirty state even when its flush fails. A
+// later successful F_FULLFSYNC would then acknowledge data that never reached
+// storage, so the first error is latched: FLUSH fails until the VMM restarts.
+static void latch_storage_error(struct block *block,int error) {
+    if(block->storage_errno)return;
+    block->storage_errno=error?error:EIO;
+    fprintf(stderr,"block[%u]: host storage error %d (%s); FLUSH fails until restart\n",
+            (unsigned)(block-blocks),block->storage_errno,strerror(block->storage_errno));
+}
 static void notify(struct block *block) {
     if(!(block->status&4) || !block->pfn) fail("queue used before ready");
     uint64_t avail=((uint64_t)block->pfn<<12)+16*QSZ;
@@ -67,40 +95,56 @@ static void notify(struct block *block) {
         uint16_t head=get(guest(avail+4+2*(block->last_avail%QSZ),2),2);
         struct desc h=descriptor(block,head);
         if(h.len!=16 || (h.flags&2) || !(h.flags&1)) fail("invalid block header");
-        uint32_t type=get(guest(h.addr,16),4);
-        uint64_t sector=get(guest(h.addr+8,8),8);
-        uint64_t offset=0; uint8_t result=(type==0||type==1||type==4)?0:2; uint32_t written=1;uint64_t transferred=0;
-        if(type==1 && block->read_only)result=1;
-        if(sector>block->disk_size/512) result=1; else offset=sector*512;
-        uint8_t *status_byte=NULL;
-        uint16_t index=h.next; unsigned count=1;
-        for(;;) {
-            if(++count>QSZ) fail("descriptor cycle");
-            struct desc d=descriptor(block,index);
-            if(!(d.flags&1)) {
-                if(!(d.flags&2) || d.len!=1) fail("invalid block->status descriptor");
-                status_byte=guest(d.addr,1); break;
+        uint8_t header[16];memcpy(header,guest(h.addr,16),sizeof(header));
+        uint32_t type=get(header,4);uint64_t sector=get(header+8,8);
+        struct desc chain[QSZ];unsigned count=0;uint16_t index=h.next;
+        uint64_t transferred=0;
+        // Snapshot and validate the entire chain before any disk side effect.
+        // Guest descriptor edits cannot redirect a descriptor after validation.
+        for(;;){
+            if(count>=QSZ-1)fail("descriptor cycle");
+            struct desc d=descriptor(block,index);chain[count++]=d;
+            if(!(d.flags&1)){
+                if(!(d.flags&2)||d.len!=1)fail("invalid block->status descriptor");
+                break;
             }
             transferred+=d.len;if(transferred>(4ULL<<20))fail("request exceeds 4 MiB");
-            if(type==0 || type==1) {
-                if(!!(d.flags&2)!=(type==0)) fail("incorrect block DMA direction");
-                if(d.len>block->disk_size || offset>block->disk_size-d.len) result=1;
-                if(!result) {
-                    size_t done=0;
-                    while(done<d.len) {
-                        ssize_t n=type==0 ? pread(block->diskfd,guest(d.addr,d.len)+done,d.len-done,offset+done)
-                            : pwrite(block->diskfd,guest(d.addr,d.len)+done,d.len-done,offset+done);
-                        if(n<0 && errno==EINTR) continue;
-                        if(n<=0) { result=1; break; } done+=n;
-                    }
-                    if(type==0) written+=done;
-                }
-                offset+=d.len;
-            } else result=2;
+            if((type==0||type==1) && !!(d.flags&2)!=(type==0))fail("incorrect block DMA direction");
             index=d.next;
         }
+        if(!budget_take(&disk_budget,transferred,1))break;
+        uint64_t offset=0;uint8_t result=(type==0||type==1||type==4)?0:2;uint32_t written=1;
+        if(type==1 && block->read_only)result=1;
+        if(sector>block->disk_size/512)result=1;else offset=sector*512;
+        uint8_t *status_byte=guest(chain[count-1].addr,1);
+        for(unsigned j=0;j+1<count;j++){
+            struct desc d=chain[j];
+            if(type==0||type==1){
+                if(d.len>block->disk_size || offset>block->disk_size-d.len)result=1;
+                if(!result){
+                    size_t done=0;
+                    while(done<d.len){
+                        ssize_t n=type==0?pread(block->diskfd,guest(d.addr,d.len)+done,d.len-done,offset+done):pwrite(block->diskfd,guest(d.addr,d.len)+done,d.len-done,offset+done);
+                        if(n<0&&errno==EINTR)continue;
+                        if(n<=0){
+                            result=1;
+                            if(type==1)latch_storage_error(block,n<0?errno:EIO);
+                            break;
+                        }
+                        done+=n;
+                        if(type==0)block->read_bytes+=(uint64_t)n;else block->write_bytes+=(uint64_t)n;
+                    }
+                    if(type==0)written+=done;
+                }
+                offset+=d.len;
+            }else result=2;
+        }
         // FLUSH has header and block->status only; perform it before publishing completion.
-        if(type==4 && !block->read_only && fsync(block->diskfd)) result=1;
+        if(type==4 && !block->read_only){
+            if(block->storage_errno)result=1;
+            else if(flush_disk(block->diskfd)){result=1;latch_storage_error(block,errno);}
+        }
+        if(result)block->errors++;
         *status_byte=result;turn_bytes+=transferred;
         put(guest(used+4+8*(block->used_idx%QSZ),8),4,head);
         put(guest(used+8+8*(block->used_idx%QSZ),4),4,written);
@@ -111,10 +155,14 @@ static void notify(struct block *block) {
     if(block->last_avail!=before){block->isr|=1; irq(block,1);}
 }
 int devices_init(void *ram,size_t size,const char *disk,const struct hvf_options *options) {
+    budget_init(&disk_budget,options->disk_bytes_per_second,options->disk_operations_per_second,4ULL<<20,32);
     memset(blocks,0,sizeof(blocks));memset(fw_dir,0,sizeof(fw_dir));memset(panic_config,0,sizeof(panic_config));
     block_count=fw_selector=fw_offset=0;guest_exit=-1;panic_bar=0x10020000;
     for(unsigned i=0;i<4;i++)blocks[i].diskfd=-1;
     if(options->drive_count>4)return -1;
+#ifdef HVF_CRASH_JOURNAL
+    crash_journal_open();  // after the FD sweep, before the sandbox
+#endif
     memory=ram; memory_size=size;
     put(panic_config,2,0x1b36);put(panic_config+2,2,0x11);put(panic_config+0x10,4,panic_bar);
     (void)disk;
@@ -137,6 +185,9 @@ int devices_init(void *ram,size_t size,const char *disk,const struct hvf_options
         struct stat st;
         if(block->diskfd<0 || fstat(block->diskfd,&st) || !S_ISREG(st.st_mode) || st.st_size<512 || st.st_size%512)return -1;
         block->disk_size=st.st_size;
+#ifdef HVF_CRASH_JOURNAL
+        crash_journal_register(block->diskfd);
+#endif
         put(block->config,2,0x1af4);put(block->config+2,2,0x1001);block->config[0xb]=1;
         put(block->config+0x10,4,block->bar);put(block->config+0x2c,2,0x1af4);put(block->config+0x2e,2,2);block->config[0x3d]=1;
     }
@@ -208,8 +259,55 @@ int devices_mmio(uint64_t addr,unsigned size,int write,uint64_t *v) {
     if(addr>=ECAM && addr<ECAM+0x1000000){if(!write)*v=0xffffffff;return 1;}
     return 0;
 }
+uint64_t devices_queue_depth(void){
+    uint64_t total=0;
+    for(unsigned i=0;i<block_count;i++){
+        struct block *b=&blocks[i];
+        if(b->pfn && (b->status&4)){
+            uint16_t n=get(guest(((uint64_t)b->pfn<<12)+16*QSZ+2,2),2);
+            if((uint16_t)(n-b->last_avail)>QSZ)fail("available ring overrun");
+            total+=(uint16_t)(n-b->last_avail);
+        }
+    }
+    return total;
+}
+int devices_pending(void){return devices_queue_depth()!=0;}
 void devices_poll(void){for(unsigned i=0;i<block_count;i++)if(blocks[i].pfn && (blocks[i].status&4))notify(&blocks[i]);}
 int devices_exit_status(void){return guest_exit;}
 void devices_close(void) {
-    for(unsigned i=0;i<block_count;i++)if(blocks[i].diskfd>=0){fprintf(stderr,"block[%u]: %lu requests\n",i,blocks[i].requests);close(blocks[i].diskfd);blocks[i].diskfd=-1;}
+    for(unsigned i=0;i<block_count;i++)if(blocks[i].diskfd>=0){
+        struct block *b=&blocks[i];
+        // A guest may exit without a final FLUSH; do not leave its last writes
+        // only in host cache. The guest is gone, so failures are only logged.
+        if(!b->read_only){
+            if(b->storage_errno)fprintf(stderr,"block[%u]: final flush skipped after storage error %d\n",i,b->storage_errno);
+            else if(flush_disk(b->diskfd))fprintf(stderr,"block[%u]: final F_FULLFSYNC failed: %s\n",i,strerror(errno));
+        }
+        fprintf(stderr,"block[%u]: %lu requests\n",i,b->requests);close(b->diskfd);b->diskfd=-1;
+    }
+}
+
+// Caller holds the global device I/O lock, as for MMIO and polling.
+void devices_metrics(uint64_t out[4]) {
+    memset(out,0,4*sizeof(*out));
+    for(unsigned i=0;i<block_count;i++){
+        out[0]+=blocks[i].requests;out[1]+=blocks[i].read_bytes;
+        out[2]+=blocks[i].write_bytes;out[3]+=blocks[i].errors;
+    }
+}
+
+void devices_snapshot(struct snapshot_io *s){
+    // A latched storage error is not serialized; never let a restore clear it.
+    for(unsigned i=0;i<block_count;i++)if(!s->restore && !s->input && blocks[i].storage_errno){s->error=1;return;}
+    uint32_t count=block_count;SNAP(s,count);if(count!=block_count){s->error=1;return;}
+    for(unsigned i=0;i<block_count;i++){
+        struct block *b=&blocks[i];uint64_t size=b->disk_size;uint32_t ro=b->read_only;
+        SNAP(s,size);SNAP(s,ro);if(size!=b->disk_size || ro!=(uint32_t)b->read_only){s->error=1;return;}
+        snapshot_bytes(s,b->config,sizeof(b->config));SNAP(s,b->status);SNAP(s,b->isr);
+        SNAP(s,b->bar);SNAP(s,b->guest_features);SNAP(s,b->pfn);SNAP(s,b->qsel);
+        SNAP(s,b->last_avail);SNAP(s,b->used_idx);SNAP(s,b->irq_level);
+        SNAP(s,b->requests);SNAP(s,b->read_bytes);SNAP(s,b->write_bytes);SNAP(s,b->errors);
+    }
+    SNAP(s,fw_selector);SNAP(s,fw_offset);SNAP(s,panic_bar);
+    snapshot_bytes(s,panic_config,sizeof(panic_config));
 }

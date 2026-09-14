@@ -1,0 +1,8 @@
+[build]
+lang = "go"
+# Mount point for the volume under test.
+dirs = ["/data"]
+
+[run]
+memory = "256M"
+cpus = 1

@@ -7,9 +7,9 @@ xcrun clang -arch arm64 -mmacosx-version-min=15.0 -Wall -Wextra -Werror -O2 \
     -Isrc/hvf-vmm/native experiments/hvf/device-test.c src/hvf-vmm/native/devices.c \
     -framework Hypervisor -o experiments/hvf/build/device-test
 codesign --force --sign - --entitlements experiments/hvf/entitlements.plist experiments/hvf/build/device-test
-for test in read write readonly unknown oob cycle short-header firmware; do
+for test in read write readonly unknown oob cycle short-header malformed-tail firmware; do
     expected=0
-    case "$test" in oob|cycle|short-header) expected=2;; esac
+    case "$test" in oob|cycle|short-header|malformed-tail) expected=2;; esac
     actual=0
     experiments/hvf/build/device-test "$test" || actual=$?
     if [ "$actual" -ne "$expected" ]; then

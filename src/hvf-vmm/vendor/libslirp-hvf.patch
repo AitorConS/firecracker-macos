@@ -1,0 +1,272 @@
+--- a/src/slirp.c
++++ b/src/slirp.c
+@@ -102,6 +102,9 @@
+ 
+ int get_dns_addr(struct in_addr *pdns_addr, uint16_t *pdns_port)
+ {
++    /* HVF: never discover a host resolver implicitly in restricted mode. */
++    int policy_dns = hvf_policy_dns(pdns_addr, pdns_port);
++    if (policy_dns) return policy_dns > 0 ? 0 : -1;
+     FIXED_INFO *FixedInfo = NULL;
+     ULONG BufLen;
+     DWORD ret;
+@@ -349,6 +352,9 @@
+ 
+ int get_dns_addr(struct in_addr *pdns_addr, uint16_t *pdns_port)
+ {
++    /* HVF: never discover a host resolver implicitly in restricted mode. */
++    int policy_dns = hvf_policy_dns(pdns_addr, pdns_port);
++    if (policy_dns) return policy_dns > 0 ? 0 : -1;
+     if (dns_addr.s_addr != 0) {
+         int ret;
+         ret = get_dns_addr_cached(pdns_addr, &dns_addr, sizeof(dns_addr),
+@@ -515,6 +521,9 @@
+ 
+ int get_dns_addr(struct in_addr *pdns_addr, uint16_t *pdns_port)
+ {
++    /* HVF: never discover a host resolver implicitly in restricted mode. */
++    int policy_dns = hvf_policy_dns(pdns_addr, pdns_port);
++    if (policy_dns) return policy_dns > 0 ? 0 : -1;
+     static struct stat dns_addr_stat;
+ 
+     if (dns_addr.s_addr != 0) {
+--- a/src/socket.c
++++ b/src/socket.c
+@@ -663,7 +663,14 @@
+                             &addrlen);
+         DEBUG_MISC(" did recvfrom %d, errno = %d-%s", m->m_len, errno,
+                    g_strerror(errno));
+-        if (m->m_len < 0) {    	
++        if (m->m_len < 0) {
++            /* Readiness can become stale, and the HVF UDP gate reports a
++             * consumed invalid envelope as EAGAIN. Neither is a remote port
++             * error: retain the socket and let UDP/application timers run. */
++            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
++                m_free(m);
++                return;
++            }
+             if (errno == ENOTCONN) {
+                 /*
+                  * UDP socket got burnt, e.g. by suspend on iOS. Tear it down
+@@ -935,6 +942,22 @@
+ {
+     so->so_state &= ~(SS_ISFCONNECTING | SS_FWDRAIN | SS_NOFDREF);
+     so->so_state |= SS_ISFCONNECTED; /* Clobber other states */
++}
++
++/* HVF: SS_NOFDREF states that the host descriptor is no longer referenced: both
++ * directions are shut down, so it can neither be read nor written and the poll
++ * loops already skip it. Keeping it open until the guest-side 2MSL expires makes
++ * peak descriptor use scale with the connection rate instead of with concurrency,
++ * which exhausts RLIMIT_NOFILE. The socket, its buffers and its TCP state machine
++ * are untouched; tcp_close() tolerates an already-released descriptor. */
++static void sorelease(struct socket *so)
++{
++    if (!have_valid_socket(so->s)) {
++        return;
++    }
++    slirp_unregister_poll_socket(so);
++    closesocket(so->s);
++    so->s = SLIRP_INVALID_SOCKET;
+ }
+ 
+ static void sofcantrcvmore(struct socket *so)
+@@ -946,6 +969,7 @@
+     if (so->so_state & SS_FCANTSENDMORE) {
+         so->so_state &= SS_PERSISTENT_MASK;
+         so->so_state |= SS_NOFDREF; /* Don't select it */
++        sorelease(so);
+     } else {
+         so->so_state |= SS_FCANTRCVMORE;
+     }
+@@ -960,6 +984,7 @@
+     if (so->so_state & SS_FCANTRCVMORE) {
+         so->so_state &= SS_PERSISTENT_MASK;
+         so->so_state |= SS_NOFDREF; /* as above */
++        sorelease(so);
+     } else {
+         so->so_state |= SS_FCANTSENDMORE;
+     }
+@@ -1045,6 +1070,14 @@
+     struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
+ 
+     uint16_t dns_port;
++    struct in_addr dns_address;
++    /* HVF: compare the resolver tuple before translating its address back to
++     * the virtual DNS address. Otherwise non-53 resolver ports leak to guests. */
++    bool dns_response = addr->ss_family == AF_INET && !slirp->disable_dns &&
++        so->so_faddr.s_addr == slirp->vnameserver_addr.s_addr &&
++        so->so_fport == htons(53) &&
++        get_dns_addr(&dns_address, &dns_port) >= 0 &&
++        sin->sin_port == dns_port && sin->sin_addr.s_addr == dns_address.s_addr;
+ 
+     switch (addr->ss_family) {
+     case AF_INET:
+@@ -1060,10 +1093,7 @@
+             }
+         }
+ 
+-        struct in_addr sin_addr;
+-        if (get_dns_addr(&sin_addr, &dns_port) >= 0 &&
+-                sin->sin_port == dns_port &&
+-                sin->sin_addr.s_addr == sin_addr.s_addr)
++        if (dns_response)
+             sin->sin_port = htons(53);
+ 
+         break;
+--- a/src/ip_input.c
++++ b/src/ip_input.c
+@@ -226,7 +226,7 @@
+ static struct ip *ip_reass(Slirp *slirp, struct ip *ip, struct ipq *q)
+ {
+     register struct mbuf *m = dtom(slirp, ip);
+-    struct ipas *first = container_of(q, struct ipas, ipq);
++    struct ipas *first = q ? container_of(q, struct ipas, ipq) : NULL;
+     register struct ipas *cursor;
+     int hlen = ip->ip_hl << 2;
+     int i, next;
+@@ -379,7 +379,7 @@
+  */
+ static void ip_freef(Slirp *slirp, struct ipq *q)
+ {
+-    struct ipas *first = container_of(q, struct ipas, ipq);
++    struct ipas *first = q ? container_of(q, struct ipas, ipq) : NULL;
+     register struct ipas *cursor, *next;
+ 
+     for (cursor = first->link.next; cursor != first; cursor = next) {
+--- a/src/tcpip.h
++++ b/src/tcpip.h
+@@ -86,12 +86,19 @@
+ #define tcpfrag_list_empty(T) ((T)->seg_next == (struct tcpiphdr *)(T))
+ 
+ /* This is the difference between the size of a tcpiphdr structure, and the
+- * size of actual ip+tcp headers, rounded up since we need to align data.  */
++ * size of actual ip+tcp headers, including the queue link that is stored
++ * immediately before the tcpiphdr while TCP fragments are reassembled.
++ *
++ * Do not round this value up.  slirp_input() already compensates for the
++ * Ethernet header before the IP header.  Rounding the reserve to 8 bytes moves
++ * tcpiphdr2qlink(ti) four bytes off pointer alignment on arm64, and the queue
++ * operations then dereference a misaligned struct qlink under UBSan.  The exact
++ * reserve keeps both the embedded qlink and tcpiphdr naturally aligned.
++ */
+ #define TCPIPHDR_DELTA                                     \
+-    (MAX(0, ((int) sizeof(struct qlink) + \
++    (MAX(0, (int) sizeof(struct qlink) + \
+              (int) sizeof(struct tcpiphdr) - (int) sizeof(struct ip) - \
+-             (int) sizeof(struct tcphdr) + 7) & \
+-                ~7))
++             (int) sizeof(struct tcphdr)))
+ 
+ /*
+  * Just a clean way to get to the first byte
+--- a/src/ncsi.c
++++ b/src/ncsi.c
+@@ -100,6 +100,14 @@
+     rsp = (struct ncsi_rsp_oem_pkt *)rnh;
+     rsp_mlx = (struct ncsi_rsp_oem_mlx_pkt *)rsp->data;
+ 
++    if (ntohs(nh->length) <
++        sizeof(cmd->mfr_id) + sizeof(struct ncsi_rsp_oem_mlx_pkt)) {
++        rsp->rsp.common.length = htons(8);
++        rsp->rsp.code = htons(NCSI_PKT_RSP_C_FAILED);
++        rsp->rsp.reason = htons(NCSI_PKT_RSP_R_LENGTH);
++        return -EINVAL;
++    }
++
+     /* Ensure the OEM response header matches the command's */
+     rsp_mlx->cmd_rev = cmd_mlx->cmd_rev;
+     rsp_mlx->cmd = cmd_mlx->cmd;
+@@ -133,9 +141,18 @@
+     const struct ncsi_rsp_oem_handler *nrh = NULL;
+     const struct ncsi_cmd_oem_pkt *cmd = (const struct ncsi_cmd_oem_pkt *)nh;
+     struct ncsi_rsp_oem_pkt *rsp = (struct ncsi_rsp_oem_pkt *)rnh;
+-    uint32_t mfr_id = ntohl(cmd->mfr_id);
++    uint32_t mfr_id;
+     int i;
++
++    if (ntohs(nh->length) < sizeof(cmd->mfr_id)) {
++        rsp->rsp.common.length = htons(4);
++        rsp->rsp.code = htons(NCSI_PKT_RSP_C_FAILED);
++        rsp->rsp.reason = htons(NCSI_PKT_RSP_R_LENGTH);
++        return -EINVAL;
++    }
+ 
++    mfr_id = ntohl(cmd->mfr_id);
++
+     rsp->mfr_id = cmd->mfr_id;
+ 
+     if (mfr_id != slirp->mfr_id) {
+@@ -283,11 +300,18 @@
+     int ncsi_rsp_len = sizeof(*nh);
+     uint32_t checksum;
+     uint32_t *pchecksum;
++    size_t payload_len;
+ 
+     if (pkt_len < ETH_HLEN + sizeof(struct ncsi_pkt_hdr)) {
+         return; /* packet too short */
+     }
+ 
++    payload_len = ntohs(nh->length);
++    if (payload_len > NCSI_MAX_PAYLOAD ||
++        payload_len > (size_t)pkt_len - ETH_HLEN - sizeof(*nh)) {
++        return; /* declared payload is truncated or unsupported */
++    }
++
+     memset(ncsi_reply, 0, sizeof(ncsi_reply));
+ 
+     memset(reh->h_dest, 0xff, ETH_ALEN);
+--- a/src/udp.c
++++ b/src/udp.c
+@@ -303,11 +303,51 @@
+     error = ip_output(so, m);
+ 
+     return (error);
++}
++
++/* HVF: the socket authority hands out a bounded pool of UDP proxies. A stub
++ * resolver uses a fresh source port per query, and each answered mapping still
++ * holds its proxy for SO_EXPIREFAST, so under high rotation the pool is full of
++ * mappings that have nothing left to carry and the next query is refused - the
++ * guest then reports a resolution timeout. Retire one such mapping instead.
++ * Only answered DNS mappings qualify: so_expire is shortened exclusively when a
++ * reply arrives and sosendto() restores the long timeout, so this excludes
++ * pending queries, and host forwards and listeners keep no expiry at all. */
++static bool udp_reclaim(Slirp *slirp)
++{
++    struct socket *so, *oldest = NULL;
++
++    for (so = slirp->udb.so_next; so != &slirp->udb; so = so->so_next) {
++        if (so->so_state & SS_HOSTFWD) {
++            continue;
++        }
++        if (so->so_expire == 0 || so->so_expire > curtime + SO_EXPIREFAST) {
++            continue;
++        }
++        /* so_m is only the ICMP backup copy of the last datagram sent, which
++         * sofree() releases; so_queued counts frames still awaiting output. */
++        if (so->so_fport != htons(53) || so->so_queued) {
++            continue;
++        }
++        if (oldest == NULL || so->so_expire < oldest->so_expire) {
++            oldest = so;
++        }
++    }
++    if (oldest == NULL) {
++        return false;
++    }
++    DEBUG_MISC(" udp_reclaim: retiring answered DNS mapping early");
++    udp_detach(oldest);
++    return true;
+ }
+ 
+ slirp_os_socket udp_attach(struct socket *so, unsigned short af)
+ {
+     so->s = slirp_socket(af, SOCK_DGRAM, 0);
++    if (!have_valid_socket(so->s) && (errno == EMFILE || errno == ENFILE) &&
++        udp_reclaim(so->slirp)) {
++        so->s = slirp_socket(af, SOCK_DGRAM, 0);
++    }
+     if (have_valid_socket(so->s)) {
+         if (slirp_bind_outbound(so, af) != 0) {
+             // bind failed - close socket

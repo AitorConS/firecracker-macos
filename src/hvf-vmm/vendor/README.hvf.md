@@ -11,7 +11,10 @@ hallazgo UBSan reproducido por el corpus de fragmentos de la campaña final.
 Valida la longitud declarada y disponible de los paquetes NC-SI antes de leer
 payloads OEM, incluidos los campos específicos de Mellanox. El corpus permanente
 `ncsi-oem-truncated-payload` reproduce la lectura fuera de límites original.
-`libslirp-version.h` se genera desde la plantilla upstream.
+`libslirp-version.h` se deriva de la plantilla upstream con la versión fijada
+en `libslirp.json` y se incluye en Git para que los builds directos no dependan
+de una configuración Meson previa. Al actualizar libslirp, actualizar también
+esta cabecera.
 
 Ambos builds locales compilan **todas** las unidades C con la inclusión forzada
 `native/slirp_policy.h`: socket, connect, bind, listen, sendto, recvfrom,

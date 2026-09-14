@@ -1,82 +1,32 @@
-# Fuzzing de dispositivos
+# Device fuzzing
 
-`experiments/hvf/fuzz/run.sh` compila los dispositivos C reales con LLVM/libFuzzer,
-ASan y UBSan. Requiere `brew install llvm`; `FUZZ_CC` admite otro clang con los
-runtimes. `FUZZ_SECONDS` cambia los 60 s por defecto. El corpus creciente, logs y
-crashes quedan bajo `experiments/hvf/build/fuzz`; los casos de regresión se
-conservan en `fuzz/corpus` y se incorporan siempre.
+`experiments/hvf/fuzz/run.sh` builds the real C devices with LLVM/libFuzzer, ASan and UBSan. It requires `brew install llvm`; `FUZZ_CC` accepts another clang with the runtimes. `FUZZ_SECONDS` changes the default 60 s. The growing corpus, logs and crashes remain under `experiments/hvf/build/fuzz`; regression cases are kept in `fuzz/corpus` and are always included.
 
-El harness configura colas válidas de bloque, TX/RX e input, modifica descriptores,
-rings y buffers, y ejecuta accesos ECAM, BAR y fw_cfg con tamaños arquitectónicos.
-Usa el código de producción para DMA, validaciones y finalización. Solo sustituye
-HVF/GIC y el transporte host de red; no prueba libslirp ni concurrencia con vCPU.
-Los rechazos que en producción terminan la VM con código 2 vuelven al harness con
-longjmp. No se interceptan abortos ni los informes de los sanitizadores.
-Cada caso tiene RAM/estado de dispositivos limpios, disco temporal privado y un
-máximo de 1024 mutaciones y 64 accesos MMIO. Las cuotas reales limitan las colas.
+The harness sets up valid block, TX/RX and input queues, mutates descriptors, rings and buffers, and performs ECAM, BAR and fw_cfg accesses with architectural sizes. It uses production code for DMA, validation and completion. It only replaces HVF/GIC and the host network transport; it does not test libslirp or concurrency with vCPU. Rejections that in production terminate the VM with exit code 2 return to the harness via longjmp. Aborts and sanitizer reports are not intercepted. Each case has clean RAM/device state, a private temporary disk and a maximum of 1024 mutations and 64 MMIO accesses. The real quotas limit the queues.
 
-La primera campaña detectó cálculo intermedio de puntero fuera del objeto en la
-lectura de configuración input (`config + off - 0x100`). Se corrigió a
-`config + (off - 0x100)` y se corrigió la expresión equivalente en la MAC de red.
-El archivo `corpus/input-config-pointer` reproduce el hallazgo original.
-Una campaña finita sin nuevos hallazgos no constituye auditoría de seguridad ni
-prueba de ausencia de fallos.
+The first campaign detected an out-of-object intermediate pointer calculation in the input config read (`config + off - 0x100`). It was fixed to `config + (off - 0x100)` and the equivalent expression in the network MAC was fixed. The file `corpus/input-config-pointer` reproduces the original finding. A finite campaign with no new findings does not constitute a security audit or proof of absence of bugs.
 
-LLVM 23/macOS notificó 56 bytes al cerrar el hilo detached de monitorización RSS
-de libFuzzer, con stack en `fuzzer::StartRssThread`, sin frames del VMM. Se usa
-`-rss_limit_mb=0` para no crear ese hilo, manteniendo LeakSanitizer activo y el
-límite por asignación en 256 MiB. No hay límite global RSS en esta campaña.
-Fuente: [implementación LLVM de StartRssThread](https://github.com/llvm/llvm-project/blob/main/compiler-rt/lib/fuzzer/FuzzerDriver.cpp).
+LLVM 23/macOS reported 56 bytes when closing libFuzzer's detached RSS monitoring thread, with a stack in `fuzzer::StartRssThread` and no VMM frames. `-rss_limit_mb=0` is used to avoid creating that thread, keeping LeakSanitizer active and the per-allocation limit at 256 MiB. There is no global RSS limit in this campaign. Source: [LLVM StartRssThread implementation](https://github.com/llvm/llvm-project/blob/main/compiler-rt/lib/fuzzer/FuzzerDriver.cpp).
 
-Campaña final local (2026-09-11): 4,912,942 casos en 61 s, código de salida 0,
-sin nuevos informes de ASan/UBSan/LeakSanitizer. Log: `build/fuzz-final.log`
-relativo a `experiments/hvf`.
+Local final campaign (2026-09-11): 4,912,942 cases in 61 s, exit code 0, with no new ASan/UBSan/LeakSanitizer reports. Log: `build/fuzz-final.log` relative to `experiments/hvf`.
 
-## Protocolo de control
+## Control protocol
 
-`sh experiments/hvf/fuzz/run-control.sh` prueba el parser y el emisor reales de
-`native/control.h` mediante pares de sockets: fragmentación, concatenación,
-versión/magic inválidos, EOF parcial e identificadores de 64 bits. El corpus y
-los artefactos quedan en `build/fuzz-control`. Usa la misma configuración de
-sanitizadores y evita el hilo RSS descrito arriba; no suprime LeakSanitizer.
-El parser HTTP Rust tiene además una campaña determinista de mutaciones:
-`HVF_FUZZ_CASES=1000000 cargo test --locked -p hvf-vmm mutation_campaign_bounded_requests`.
-Esta campaña valida los límites del parser; los sanitizadores C se aplican a los
-otros targets, no se atribuyen al test Rust.
+`sh experiments/hvf/fuzz/run-control.sh` tests the real parser and emitter from `native/control.h` via socket pairs: fragmentation, concatenation, invalid version/magic, partial EOF and 64-bit identifiers. The corpus and artifacts remain in `build/fuzz-control`. It uses the same sanitizer configuration and avoids the RSS thread described above; it does not suppress LeakSanitizer. The Rust HTTP parser also has a deterministic mutation campaign: `HVF_FUZZ_CASES=1000000 cargo test --locked -p hvf-vmm mutation_campaign_bounded_requests`. This campaign validates the parser limits; the C sanitizers apply to the other targets, not to the Rust test.
 
-## libslirp vendorizado
+## Vendored libslirp
 
-`sh experiments/hvf/fuzz/run-slirp.sh` compila libslirp 4.9.4 y los adaptadores
-con ASan/UBSan/libFuzzer. Usa las mismas inclusiones obligatorias de política de
-sockets que el producto, sin egress/DNS/listeners autorizados. Cada entrada crea,
-procesa y destruye una pila; GLib local todavía no está instrumentado. Este target
-no sustituye el fuzzing de IPC de la autoridad ni las pruebas con permisos activos.
+`sh experiments/hvf/fuzz/run-slirp.sh` builds libslirp 4.9.4 and the adapters with ASan/UBSan/libFuzzer. It uses the same mandatory socket-policy inclusions as the product, with no authorized egress/DNS/listeners. Each input creates, processes and destroys a stack; the local GLib is still not instrumented. This target does not replace IPC authority fuzzing or testing with active permissions.
 
-Primera campaña: 2.502.154 entradas en 61 segundos sin informes de sanitizadores;
-evidencia `build/slirp-fuzz.log`. La campaña de dispositivos posterior a copiar y
-validar cadenas completas ejecutó 4.798.923 entradas/61 s (`build/resources-fuzz.log`).
+First campaign: 2,502,154 inputs in 61 seconds with no sanitizer reports; evidence in `build/slirp-fuzz.log`. The device campaign after copying and validating full strings ran 4,798,923 inputs/61 s (`build/resources-fuzz.log`).
 
-## Cierre de implementación y snapshots
+## Implementation closure and snapshots
 
-El target de dispositivos también deserializa el estado de bloques, red e input
-mediante el lector de snapshots de producción, usando entradas de memoria
-acotadas. El manifiesto, sus hashes y los registros/GIC se prueban por separado
-con restauraciones HVF y corrupción deliberada en `test_snapshot.py`.
+The device target also deserializes block, network and input state via the production snapshot reader, using bounded memory inputs. The manifest, its hashes and the registers/GIC are tested separately with HVF restores and deliberate corruption in `test_snapshot.py`.
 
-Campañas de 600 segundos completadas el 2026-09-12:
-- Dispositivos: 34.717.374 entradas/601 s (`build/final-device-fuzz.log`).
-- Control: 25.897.533 entradas/601 s (`build/final-control-fuzz.log`).
-- HTTP: un millón de mutaciones (`build/final-http-mutation.log`).
+600-second campaigns completed on 2026-09-12:
+- Devices: 34,717,374 inputs/601 s (`build/final-device-fuzz.log`).
+- Control: 25,897,533 inputs/601 s (`build/final-control-fuzz.log`).
+- HTTP: one million mutations (`build/final-http-mutation.log`).
 
-La primera campaña prolongada de libslirp encontró aritmética sobre NULL en
-`ip_reass` al llegar el primer fragmento IPv4. El parche calcula container_of
-solo cuando ya existe una cola; conserva el flujo de creación de la cola nueva.
-`slirp-corpus/ipv4-first-fragment-null-queue` conserva la entrada y se incorpora
-en cada ejecución. El archivo original y el informe UBSan permanecen en
-`build/final-slirp-fuzz.log`; la repetición está en
-`build/final-slirp-fuzz-fixed.log`. Esa repetición encontró un heap-buffer-overflow
-ASan distinto en `ncsi_rsp_handler_oem` (`vendor/libslirp/src/ncsi.c:136`): un
-paquete de 31 bytes declaraba un payload OEM truncado y la función leía cuatro
-bytes de fabricante donde solo quedaba uno. La validación comprueba ahora el
-payload declarado, los bytes realmente disponibles y los mínimos OEM/Mellanox.
-`slirp-corpus/ncsi-oem-truncated-payload` conserva el caso como regresión.
+The first extended libslirp campaign found arithmetic on NULL in `ip_reass` when the first IPv4 fragment arrived. The patch computes container_of only when a queue already exists; it preserves the new-queue creation flow. `slirp-corpus/ipv4-first-fragment-null-queue` preserves the input and is included on every run. The original file and the UBSan report remain in `build/final-slirp-fuzz.log`; the rerun is in `build/final-slirp-fuzz-fixed.log`. That rerun found a different ASan heap-buffer-overflow in `ncsi_rsp_handler_oem` (`vendor/libslirp/src/ncsi.c:136`): a 31-byte packet declared a truncated OEM payload and the function read four vendor bytes where only one remained. Validation now checks the declared payload, the bytes actually available, and the OEM/Mellanox minimums. `slirp-corpus/ncsi-oem-truncated-payload` preserves the case as a regression.

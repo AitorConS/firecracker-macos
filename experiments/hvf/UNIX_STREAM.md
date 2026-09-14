@@ -1,10 +1,10 @@
-# Transporte Ethernet Unix para HVF
+# Unix Ethernet Transport for HVF
 
-`unix-stream` es un cliente Ethernet genérico compatible con el framing del
-[netdev stream de QEMU](https://www.qemu.org/docs/master/system/qemu-manpage.html).
-No necesita ejecutar QEMU. El VMM no gestiona IPAM ni DNS de servicios.
-El switch externo configura y autoriza la red. `slirp` conserva su
-configuración y su autoridad de sockets independiente.
+`unix-stream` is a generic Ethernet client compatible with the framing of
+[QEMU netdev stream](https://www.qemu.org/docs/master/system/qemu-manpage.html).
+It does not need to run QEMU. The VMM does not manage IPAM or service DNS.
+The external switch configures and authorizes the network. `slirp` retains its
+configuration and its independent socket authority.
 
 ```json
 {
@@ -21,53 +21,53 @@ configuración y su autoridad de sockets independiente.
 }
 ```
 
-Esas secciones se añaden a una configuración normal de boot/machine/drives.
-La autorización `security.unix_stream` debe coincidir exactamente con el socket
-del backend. Se rechazan `forwards`, `security.egress`, `security.listeners` y
-`security.dns` con este transporte: el switch externo es la autoridad IP y debe
-aplicar esos permisos. Conceder el socket concede conectividad al switch que lo
-atiende; el VMM no promete filtrar sus destinos IP.
+Those sections are added to a normal boot/machine/drives configuration.
+The `security.unix_stream` authorization must exactly match the backend
+socket. `forwards`, `security.egress`, `security.listeners` and
+`security.dns` are rejected with this transport: the external switch is the IP authority and must
+enforce those permissions. Granting the socket grants connectivity to the switch serving
+it; the VMM does not promise to filter its IP destinations.
 
-El directorio padre debe pertenecer al usuario y ser privado (0700); el socket
-debe pertenecer al mismo usuario y ser 0600. Se resuelve el padre antes de
-instalar Seatbelt. El broker recibe solamente permiso de conexión y metadata
-para esa ruta canónica, comprueba `getpeereid`, y no obtiene permiso de conexión
-Internet, apertura de archivos del host ni acceso a otros sockets Unix. El VMM
-mantiene su sandbox habitual. La protección no pretende aislar procesos
-maliciosos del mismo UID capaces de modificar el directorio autorizado.
-El cliente nunca crea, elimina ni sustituye el socket del servidor.
+The parent directory must be user-owned and private (0700); the socket
+must belong to the same user and be 0600. The parent is resolved before
+installing Seatbelt. The broker receives only connection and metadata
+permission for that canonical path, checks `getpeereid`, and obtains no Internet connection
+permission, host file opening, or access to other Unix sockets. The VMM
+keeps its usual sandbox. The protection does not aim to isolate malicious
+processes with the same UID capable of modifying the authorized directory.
+The client never creates, deletes, or replaces the server socket.
 
-## Contrato de transporte
+## Transport contract
 
-- Una longitud **u32 big endian**, seguida de la trama Ethernet sin prefijos
-  VirtIO ni cabeceras de offload. Tamaño admitido: 14–65536 bytes.
-- RX y TX usan cada uno un buffer fijo de 65540 bytes. Se conservan offsets
-  entre operaciones parciales; se valida la longitud antes de leer el payload.
-- El broker mantiene una sola trama TX pendiente. Si se satura, descarta la
-  siguiente trama completa; nunca intercala bytes ni trunca la trama pendiente.
-  Los descartes se suman a los contadores TX de la API. El IPC broker/VMM y el
-  procesamiento por poll también están acotados.
-- El arranque exige poder iniciar la conexión. Una vez arrancado, EOF, errores,
-  framing inválido o cinco segundos sin progreso de una trama/conexión pendiente
-  cierran el enlace, descartan su estado parcial y reintentan cada segundo.
-  No se retransmiten tramas pendientes al nuevo peer. Las aplicaciones deben
-  tolerar pérdida y reconectar; no se preservan sesiones TCP del switch reiniciado.
-- Se aplican las cuotas agregadas de bytes/paquetes de VirtIO existentes.
-  Pause/Resume mantiene la barrera del broker; no procesa tramas mientras está
-  pausado. Los deadlines de transporte usan tiempo monotónico del host.
-- Los snapshots conservan el dispositivo, pero no el estado del switch externo.
-  Antes de restaurar, configurar una interfaz `unix-stream` con el mismo
-  `iface_id` y MAC, un socket actual y su autorización `security.unix_stream`.
-  La restauración valida esa compatibilidad y reconecta al socket autorizado;
-  nunca reutiliza implícitamente la autoridad guardada en el snapshot.
-  Slirp también reinicializa la red al restaurar.
+- A **u32 big endian** length, followed by the Ethernet frame with no
+  VirtIO prefixes or offload headers. Supported size: 14–65536 bytes.
+- RX and TX each use a fixed 65540-byte buffer. Offsets are preserved
+  across partial operations; the length is validated before reading the payload.
+- The broker holds a single pending TX frame. If saturated, it drops the
+  next complete frame; it never interleaves bytes nor truncates the pending frame.
+  Drops are added to the API TX counters. Broker/VMM IPC and
+  poll-based processing are also bounded.
+- Startup requires being able to initiate the connection. Once started, EOF, errors,
+  invalid framing, or five seconds without progress on a pending frame/connection
+  close the link, discard its partial state, and retry every second.
+  Pending frames are not retransmitted to the new peer. Applications must
+  tolerate loss and reconnect; TCP sessions of the restarted switch are not preserved.
+- Existing aggregate VirtIO byte/packet quotas apply.
+  Pause/Resume maintains the broker barrier; it does not process frames while
+  paused. Transport deadlines use host monotonic time.
+- Snapshots preserve the device, but not the external switch state.
+  Before restoring, configure a `unix-stream` interface with the same
+  `iface_id` and MAC, a current socket, and its `security.unix_stream` authorization.
+  Restoration validates that compatibility and reconnects to the authorized socket;
+  it never implicitly reuses the authority saved in the snapshot.
+  Slirp also reinitializes networking on restore.
 
-`GET /capabilities` anuncia ambos backends, el framing, tamaño máximo, intervalo
-de reconexión, contrato de restauración de snapshots y
-`network_policy: external-switch-unix-capability` cuando corresponde. La API
-macOS sigue siendo 1.0; son campos aditivos. Linux/KVM usa su backend separado.
+`GET /capabilities` advertises both backends, framing, maximum size, reconnection
+interval, snapshot restore contract, and
+`network_policy: external-switch-unix-capability` when applicable. The
+macOS API remains 1.0; these are additive fields. Linux/KVM uses its separate backend.
 
-## Build y validación sin sustituir otro trabajo
+## Build and validation without replacing other work
 
 ```sh
 export CARGO_TARGET_DIR="$PWD/experiments/hvf/build/my-network-cargo"
@@ -79,15 +79,15 @@ sh experiments/hvf/test-network-stream.sh
 python3 -m unittest discover -s experiments/hvf -p test_network_stream.py -v
 ```
 
-El helper C usa ASan/UBSan y prueba framing fragmentado/coalescido, longitudes
-adversariales, escrituras parciales, saturación, timeout, EOF, permisos y
-reconexión. El helper Seatbelt verifica conexiones permitidas y denegadas.
-La prueba API arranca una VM HVF real y comprueba reconexión, capacidades,
-Pause/Resume y captura de snapshot. Los tests Rust comprueban la compatibilidad
-de interfaz y la sustitución explícita de la autorización al restaurar.
+The C helper uses ASan/UBSan and tests fragmented/coalesced framing, adversarial
+lengths, partial writes, saturation, timeout, EOF, permissions, and
+reconnection. The Seatbelt helper verifies allowed and denied connections.
+The API test boots a real HVF VM and checks reconnection, capabilities,
+Pause/Resume, and snapshot capture. The Rust tests check interface
+compatibility and explicit replacement of the authorization on restore.
 
-`distribution/verify-reproducible.py --reuse-native --output NUEVO_DIRECTORIO`
-reconstruye el VMM en dos targets y empaqueta las dependencias ya instaladas,
-sin sustituir dylibs usadas por otra campaña. Su informe distingue ese alcance
-de una reconstrucción completa de dependencias. Los paquetes conservan firma
-ad-hoc, entitlement Hypervisor, dependencias relativas, licencias y checksums.
+`distribution/verify-reproducible.py --reuse-native --output NEW_DIRECTORY`
+rebuilds the VMM for two targets and packages the already installed dependencies,
+without replacing dylibs used by another campaign. Its report distinguishes that scope
+from a full dependency rebuild. The packages preserve ad-hoc
+signature, Hypervisor entitlement, relative dependencies, licenses, and checksums.

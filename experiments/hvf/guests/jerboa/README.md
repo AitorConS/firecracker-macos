@@ -1,15 +1,15 @@
-# Huésped opcional: Jerboa
+# Optional guest: Jerboa
 
-Proporciona un ELF ARM64 y una imagen de bloques ya preparados por herramientas
-externas. Este adaptador traduce variables a `opt/uni/env`; es el único lugar
-que conoce esa convención. El VMM entrega bytes de firmware y bloques opacos.
+Provides an ARM64 ELF and a block image already prepared by external
+tools. This adapter translates variables to `opt/uni/env`; it is the only place
+that knows that convention. The VMM delivers firmware bytes and opaque blocks.
 
 ```sh
-python3 experiments/hvf/guests/jerboa/run.py --kernel /ruta/kernel.img \
-  --disk /ruta/root.img --cpus 4 --port 18080 --env MARKER=hvf-smoke
+python3 experiments/hvf/guests/jerboa/run.py --kernel /path/kernel.img \
+  --disk /path/root.img --cpus 4 --port 18080 --env MARKER=hvf-smoke
 ```
 
-La raíz se copia por defecto; `--persistent` permite escribir el original. No
-se generan imágenes ni se modifica o compila el kernel aquí. Los parches SMP
-son responsabilidad del proyecto del huésped. Esta prueba no se ejecuta en la
-batería genérica ni requiere que exista un checkout de Jerboa junto al fork.
+The root is copied by default; `--persistent` allows writing the original. No
+images are generated nor is the kernel modified or compiled here. SMP patches
+are the responsibility of the guest project. This test does not run in the
+generic suite nor does it require a Jerboa checkout next to the fork.

@@ -10,5 +10,11 @@ int main(void){
     assert(!budget_take_at(&b,1,0,1)); // backwards time does not create credit
     assert(budget_take_at(&b,100,1,UINT64_MAX)); // overflow-safe refill, capped burst
     assert(!budget_take_at(&b,1,0,UINT64_MAX));
+    for(unsigned i=0;i<1000;i++){
+        budget_refund(&b,100,1);
+        assert(budget_take_at(&b,100,1,UINT64_MAX));
+    }
+    budget_refund(&b,UINT64_MAX,UINT64_MAX);
+    assert(b.bytes==b.byte_capacity && b.ops==b.op_capacity);
     puts("I/O budget burst, fractional refill, backwards clock and overflow: PASS");
 }

@@ -16,7 +16,7 @@ static struct budget network_budget;
 #define BAR 0x10010000ULL
 #define ECAM 0x3f008000ULL
 #define QSZ 256
-static int enabled;
+static int enabled,quiescing;
 static uint8_t *ram;
 static size_t ram_size;
 static uint8_t cfg[256],status,isr;
@@ -57,7 +57,14 @@ static void complete(struct queue *q,uint16_t h,uint32_t n){
 static ssize_t receive(const void *buf,size_t len,void *opaque){
     (void)opaque;
     struct queue *q=&queues[0];
-    if(!pending(q)){drop_packets++;drop_bytes+=len;return len;} // allow protocol retransmission when RX ring is empty
+    // Keep the bounded IPC frame until the guest replenishes RX descriptors.
+    // An empty ring is temporary backpressure, not a malformed packet.
+    if(!pending(q)){
+        // Parked vCPUs cannot replenish descriptors. Pause drains the finite
+        // broker queue and accounts these packets as drops before snapshot.
+        if(quiescing){drop_packets++;drop_bytes+=len;return len;}
+        errno=EAGAIN;return -1;
+    }
     if(len>65536-10)die("oversized frame");
     if(!budget_take(&network_budget,len,1)){errno=EAGAIN;return -1;}
     uint8_t frame[65536]={0};memcpy(frame+10,buf,len);size_t total=len+10,done=0;
@@ -83,13 +90,14 @@ static void transmit(void){
         }
         if(len<24 || frame[0] || frame[1])die("TX header/offload unsupported");
         if(!budget_take(&network_budget,len-10,1))break;
-        complete(q,h,0);net_backend_send(frame+10,len-10);tx++;tx_bytes+=len-10;
+        if(!net_backend_send(frame+10,len-10)){budget_refund(&network_budget,len-10,1);break;}
+        complete(q,h,0);tx++;tx_bytes+=len-10;
     }
 }
 int net_init(void *memory,size_t size,const struct hvf_options *options){
     budget_init(&network_budget,options->network_bytes_per_second,options->network_packets_per_second,256ULL<<10,256);
     memset(cfg,0,sizeof(cfg));memset(queues,0,sizeof(queues));
-    status=isr=features=selectq=rx=tx=0;bar=BAR;
+    status=isr=features=selectq=rx=tx=0;quiescing=0;bar=BAR;
     rx_bytes=tx_bytes=drop_packets=drop_bytes=0;
     ram=memory;ram_size=size;enabled=options->network_enabled;if(!enabled)return 0;
     memcpy(mac,options->mac,6);
@@ -111,7 +119,7 @@ int net_mmio(uint64_t addr,unsigned size,int write,uint64_t *v){
         case 4:if(size!=4||(*v&~(1U<<5)))return 0;features=*v;break;
         case 8:if(size!=4||!q)return 0;*q=(struct queue){.pfn=*v};break;
         case 14:if(size!=2)return 0;selectq=*v;break;
-        case 16:if(size!=2||*v>1)return 0;if(*v==1)transmit();break;
+        case 16:if(size!=2||*v>1)return 0;if(*v==1)transmit();else net_backend_poll();break;
         case 18:if(size!=1)return 0;status=*v;if(!status){memset(queues,0,sizeof(queues));features=0;isr=0;irq(0);}break;
         default:return 0;
     }}else{switch(off){
@@ -126,6 +134,7 @@ int net_mmio(uint64_t addr,unsigned size,int write,uint64_t *v){
     }}return 1;
 }
 int net_pending_tx(void){return enabled && pending(&queues[1]);}
+void net_quiesce(int value){quiescing=value;}
 void net_poll(void){if(enabled){transmit();net_backend_poll();}}
 void net_close(void){if(enabled){fprintf(stderr,"network: TX=%lu RX=%lu\n",tx,rx);net_backend_close();enabled=0;}}
 

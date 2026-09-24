@@ -12,12 +12,13 @@
 #include <string.h>
 #include "net_backend.h"
 #define STREAM_FRAME 65536u
+#define STREAM_TX_CAPACITY (1024u * 1024u)
 static struct {
     int fd, connecting, paused;
     const char *path;
     net_receive_fn receive;
-    uint8_t rx[STREAM_FRAME+4], tx[STREAM_FRAME+4];
-    size_t used, need, sent, queued;
+    uint8_t rx[STREAM_FRAME+4], tx[STREAM_TX_CAPACITY];
+    size_t used, need, sent, queued, tx_head;
     uint64_t retry, progress, tx_progress, drops, drop_bytes;
 } stream = {.fd=-1};
 static uint64_t stream_ms(void) {
@@ -27,8 +28,12 @@ static uint64_t stream_ms(void) {
 static void stream_disconnect(void) {
     if(stream.fd>=0)close(stream.fd);
     stream.fd=-1;stream.connecting=0;stream.used=0;stream.need=4;
-    if(stream.queued){stream.drops++;stream.drop_bytes+=stream.queued-4;}
-    stream.queued=stream.sent=0;stream.retry=stream_ms()+1000;
+    for(size_t offset=stream.tx_head;offset<stream.queued;){
+        uint32_t size=0;
+        for(unsigned i=0;i<4;i++)size=(size<<8)|stream.tx[offset+i];
+        stream.drops++;stream.drop_bytes+=size;offset+=size+4;
+    }
+    stream.queued=stream.sent=stream.tx_head=0;stream.retry=stream_ms()+1000;
 }
 static int stream_peer(void) {
     uid_t uid;gid_t gid;
@@ -58,19 +63,37 @@ static int stream_open(const struct hvf_options *options,net_receive_fn receive)
 }
 static void stream_flush(void) {
     while(stream.fd>=0 && !stream.connecting && stream.sent<stream.queued){
-        ssize_t n=send(stream.fd,stream.tx+stream.sent,stream.queued-stream.sent,0);
+        uint32_t size=0;
+        for(unsigned i=0;i<4;i++)size=(size<<8)|stream.tx[stream.tx_head+i];
+        size_t end=stream.tx_head+size+4;
+        ssize_t n=send(stream.fd,stream.tx+stream.sent,end-stream.sent,0);
         if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR))return;
-        if(n<=0){stream_disconnect();return;}stream.sent+=(size_t)n;stream.tx_progress=stream_ms();
+        if(n<=0){stream_disconnect();return;}
+        stream.sent+=(size_t)n;stream.tx_progress=stream_ms();
+        if(stream.sent==end)stream.tx_head=end;
     }
-    if(stream.sent==stream.queued)stream.sent=stream.queued=0;
+    if(stream.sent==stream.queued)stream.sent=stream.queued=stream.tx_head=0;
 }
-// One bounded pending frame. Saturation drops whole Ethernet frames, never bytes
-// from a partially transmitted frame. VirtIO's aggregate quotas apply upstream.
+// A bounded byte queue absorbs ordinary VirtIO bursts. Saturation still drops
+// whole new frames; a partially transmitted frame is retained until completion.
 static void stream_send(const void *data,size_t size) {
     if(size<14||size>STREAM_FRAME)return;
-    stream_flush();if(stream.fd<0||stream.queued){stream.drops++;stream.drop_bytes+=size;return;}
-    for(unsigned i=0;i<4;i++)stream.tx[i]=(uint8_t)(size>>(24-8*i));
-    memcpy(stream.tx+4,data,size);stream.queued=size+4;stream.tx_progress=stream_ms();stream_flush();
+    stream_flush();
+    if(stream.fd<0 || size+4>sizeof(stream.tx)-(stream.queued-stream.tx_head)){
+        stream.drops++;stream.drop_bytes+=size;return;
+    }
+    if(size+4>sizeof(stream.tx)-stream.queued){
+        memmove(stream.tx,stream.tx+stream.tx_head,stream.queued-stream.tx_head);
+        stream.queued-=stream.tx_head;stream.sent-=stream.tx_head;stream.tx_head=0;
+    }
+    // New arrivals must not extend a stalled writer's timeout indefinitely.
+    if(!stream.queued)stream.tx_progress=stream_ms();
+    for(unsigned i=0;i<4;i++)stream.tx[stream.queued+i]=(uint8_t)(size>>(24-8*i));
+    memcpy(stream.tx+stream.queued+4,data,size);stream.queued+=size+4;
+    stream_flush();
+}
+static int stream_can_send(void) {
+    return stream.fd>=0 && STREAM_FRAME+4<=sizeof(stream.tx)-(stream.queued-stream.tx_head);
 }
 static void stream_poll(void) {
     if(stream.paused)return;
@@ -87,6 +110,15 @@ static void stream_poll(void) {
     }
     stream_flush();
     for(unsigned budget=0;budget<256 && stream.fd>=0;budget++){
+        if(stream.used==stream.need && stream.need>4){
+            ssize_t delivered=stream.receive(stream.rx+4,stream.need-4,NULL);
+            if(delivered<0){
+                if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=ENOBUFS&&errno!=EINTR)
+                    stream_disconnect();
+                return;
+            }
+            stream.need=4;stream.used=0;
+        }
         ssize_t n=recv(stream.fd,stream.rx+stream.used,stream.need-stream.used,0);
         if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR))return;
         if(n<=0){stream_disconnect();return;}stream.used+=(size_t)n;stream.progress=stream_ms();
@@ -95,9 +127,7 @@ static void stream_poll(void) {
             uint32_t size=0;for(unsigned i=0;i<4;i++)size=(size<<8)|stream.rx[i];
             if(size<14||size>STREAM_FRAME){stream_disconnect();return;}
             stream.need=size+4;
-        }else{
-            (void)stream.receive(stream.rx+4,stream.need-4,NULL);
-            stream.need=4;stream.used=0;
         }
+
     }
 }

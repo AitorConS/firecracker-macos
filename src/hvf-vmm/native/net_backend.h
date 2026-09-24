@@ -4,7 +4,8 @@
 #include "hvf.h"
 typedef ssize_t (*net_receive_fn)(const void *,size_t,void *);
 int net_backend_open(const struct hvf_options *,net_receive_fn);
-void net_backend_send(const void *,size_t);
+/* Returns zero when the bounded IPC queue is full; retain the VirtIO descriptor. */
+int net_backend_send(const void *,size_t);
 void net_backend_poll(void);
 void net_backend_close(void);
 int net_backend_pid(void);
@@ -21,3 +22,5 @@ void slirp_backend_poll(void);
 void slirp_backend_close(void);
 
 void net_backend_metrics(uint64_t out[7]);
+
+void net_backend_wait(int control_fd,int running);

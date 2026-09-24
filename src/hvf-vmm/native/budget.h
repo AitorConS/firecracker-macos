@@ -28,3 +28,10 @@ static inline int budget_take_at(struct budget *b,uint64_t bytes,uint64_t ops,ui
     b->bytes-=bytes;b->ops-=ops;return 1;
 }
 static inline int budget_take(struct budget *b,uint64_t bytes,uint64_t ops){return budget_take_at(b,bytes,ops,budget_now());}
+
+// Return a charge when bounded I/O could not accept the operation. Retrying a
+// full queue must not spend the same packet's rate allowance repeatedly.
+static inline void budget_refund(struct budget *b,uint64_t bytes,uint64_t ops){
+    b->bytes+=bytes>b->byte_capacity-b->bytes?b->byte_capacity-b->bytes:bytes;
+    b->ops+=ops>b->op_capacity-b->ops?b->op_capacity-b->ops:ops;
+}

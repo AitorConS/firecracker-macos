@@ -431,6 +431,7 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
         }
         if(phase==1)kick_cpus(); // Repeat: a CPU can enter hv_vcpu_run after an earlier kick.
         pthread_mutex_lock(&io_lock);
+        if(phase==1 && parked_cpus()==(int)ncpus)net_quiesce(1);
         if(phase<3){devices_poll();net_poll();}else net_backend_health();
         if(phase==1 && parked_cpus()==(int)ncpus && !devices_pending() && !net_pending_tx()){
             paused_ticks=mach_absolute_time();
@@ -440,6 +441,7 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
             phase=3;if(control_send(options->ready_fd,'P',transition))finish(143);
         }
         if(phase==4 && net_backend_pause_ready(transition)){
+            net_quiesce(0);
             uint64_t elapsed=mach_absolute_time()-paused_ticks;
             mach_timebase_info_data_t timebase;mach_timebase_info(&timebase);
             clock_offset_ns+=(uint64_t)((__uint128_t)elapsed*timebase.numer/timebase.denom);
@@ -472,7 +474,7 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
         }
         pthread_mutex_unlock(&io_lock);
         if(options->timeout_ms && seconds()>=deadline){fprintf(stderr,"HVF: watchdog deadline\n");finish(124);}
-        usleep(1000);
+        net_backend_wait(options->ready_fd,phase<3);
     }
     pthread_mutex_lock(&state_lock);pthread_cond_broadcast(&state_change);pthread_mutex_unlock(&state_lock);
     // A canceled exit wakes sleeping/running CPUs so all can join teardown.

@@ -20,7 +20,7 @@ static int disk=-1;
 _Noreturn void fuzz_exit(int status){if(status==2)longjmp(rejected,1);abort();}
 int fuzz_log(FILE *stream,const char *format,...){(void)stream;(void)format;return 0;}
 int net_backend_open(const struct hvf_options *o,net_receive_fn cb){(void)o;receive_packet=cb;return 0;}
-void net_backend_send(const void *p,size_t n){(void)p;(void)n;}
+int net_backend_send(const void *p,size_t n){(void)p;(void)n;return 1;}
 void net_backend_poll(void){}
 void net_backend_close(void){receive_packet=NULL;}
 static void put(size_t off,unsigned size,uint64_t value){memcpy(ram+off,&value,size);}

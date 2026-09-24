@@ -16,14 +16,15 @@
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #include "net_backend_stream.h"
 
 static int frames=-1,health=-1,stats=-1;
 static uint64_t stream_drops,stream_drop_bytes;
-static uint64_t tx_drops,tx_drop_bytes,rx_drops,rx_drop_bytes,stats_drops;
+static uint64_t rx_drops,rx_drop_bytes,stats_drops;
 static uint8_t deferred_frame[65536];
-static size_t deferred_size;
+static _Atomic size_t deferred_size;
 static pid_t broker=-1;
 static struct control_reader health_reader;
 static uint64_t pause_operation, pause_ack;
@@ -34,6 +35,10 @@ static ssize_t broker_deliver(const void *data,size_t size,void *opaque){
     ssize_t n=send(frames,data,size,MSG_DONTWAIT);
     // Bounded datagram queues may drop under load; protocols can retransmit.
     if(n<0 && (errno==EAGAIN||errno==EWOULDBLOCK||errno==ENOBUFS)){rx_drops++;rx_drop_bytes+=size;return (ssize_t)size;}return n;
+}
+static ssize_t stream_deliver(const void *data,size_t size,void *opaque){
+    (void)opaque;
+    return send(frames,data,size,MSG_DONTWAIT);
 }
 static void broker_main(const struct hvf_options *options){
     if(net_forget_guest_memory())_exit(2);
@@ -53,7 +58,7 @@ static void broker_main(const struct hvf_options *options){
        ((!is_stream && hvf_gate_start()) || hvf_sandbox_install(options->security->broker_profile))){
         (void)control_send(health,'E',0);_exit(2);
     }
-    if(is_stream?stream_open(options,broker_deliver):slirp_backend_open(options,broker_deliver)){
+    if(is_stream?stream_open(options,stream_deliver):slirp_backend_open(options,broker_deliver)){
         (void)control_send(health,'E',0);_exit(2);
     }
     if(control_send(health,'B',0))_exit(2);
@@ -69,8 +74,17 @@ static void broker_main(const struct hvf_options *options){
             if(send(stats,packet,sizeof(packet),MSG_DONTWAIT)!=(ssize_t)sizeof(packet))stats_drops++;next_stats=ms+100;
         }
         if(!is_stream && hvf_gate_check()){fprintf(stderr,"socket authority disconnected\n");_exit(2);}
-        struct pollfd fds[2]={{health,POLLIN,0},{frames,POLLIN,0}};
-        int result=poll(fds,2,1);
+        // Wake for incoming Ethernet as well as guest TX. Polling only the
+        // IPC socket imposed a timer tick on every inbound burst.
+        int blocked_rx=is_stream && stream.used==stream.need && stream.need>4;
+        short stream_events=blocked_rx?0:POLLIN;
+        if(stream.connecting || stream.queued)stream_events|=POLLOUT;
+        short ipc_events=(!is_stream || stream_can_send())?POLLIN:0;
+        if(blocked_rx)ipc_events|=POLLOUT;
+        struct pollfd fds[3]={{health,POLLIN,0},
+            {frames,ipc_events,0},
+            {is_stream && !paused?stream.fd:-1,stream_events,0}};
+        int result=poll(fds,3,1);
         if(result<0&&errno!=EINTR)break;
         if(fds[0].revents){
             uint8_t kind;uint64_t operation;
@@ -93,6 +107,7 @@ static void broker_main(const struct hvf_options *options){
         }
         if(paused){usleep(1000);continue;}
         for(unsigned budget=0;budget<256;budget++){
+            if(is_stream && !stream_can_send())break;
             ssize_t n=recv(frames,packet,sizeof(packet),MSG_DONTWAIT);
             if(n<0){if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)goto done;break;}
             if(n<14||n>65536)goto done;
@@ -124,8 +139,11 @@ int net_backend_open(const struct hvf_options *options,net_receive_fn receive){
     if(poll(&ready,1,3000)>0 && control_receive(health,&reader,&kind,&operation)==1 && kind=='B' && operation==0)return 0;
     net_backend_close();return -1;
 }
-void net_backend_send(const void *data,size_t size){
-    if(send(frames,data,size,MSG_DONTWAIT)<0){if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=ENOBUFS)fail("broker send failed");tx_drops++;tx_drop_bytes+=size;}
+int net_backend_send(const void *data,size_t size){
+    ssize_t n=send(frames,data,size,MSG_DONTWAIT);
+    if(n==(ssize_t)size)return 1;
+    if(n<0 && (errno==EAGAIN||errno==EWOULDBLOCK||errno==ENOBUFS||errno==EINTR))return 0;
+    fail("broker send failed");return 0;
 }
 void net_backend_poll(void){
     uint8_t packet[65537];
@@ -180,5 +198,13 @@ void net_backend_metrics(uint64_t out[7]){
         rx_drops=values[0];rx_drop_bytes=values[1];stats_drops=values[2];stream_drops=values[3];stream_drop_bytes=values[4];
     }
     int next=0;if(frames>=0 && ioctl(frames,FIONREAD,&next))next=-1;
-    out[0]=next>=0?(uint64_t)next:UINT64_MAX;out[1]=deferred_size;out[2]=tx_drops+stream_drops;out[3]=tx_drop_bytes+stream_drop_bytes;out[4]=rx_drops;out[5]=rx_drop_bytes;out[6]=stats_drops;
+    out[0]=next>=0?(uint64_t)next:UINT64_MAX;out[1]=deferred_size;out[2]=stream_drops;out[3]=stream_drop_bytes;out[4]=rx_drops;out[5]=rx_drop_bytes;out[6]=stats_drops;
+}
+
+// Called outside the device lock. Only the deferred length is shared with the
+// vCPU RX-kick path; descriptors remain open until all vCPUs have stopped.
+void net_backend_wait(int control_fd,int running){
+    struct pollfd fds[3]={{control_fd,POLLIN,0},{health,POLLIN,0},
+        {running && !atomic_load(&deferred_size)?frames:-1,POLLIN,0}};
+    (void)poll(fds,3,1);
 }

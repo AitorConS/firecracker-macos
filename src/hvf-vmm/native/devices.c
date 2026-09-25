@@ -8,6 +8,7 @@ static struct budget disk_budget;
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <sys/uio.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -117,28 +118,38 @@ static void notify(struct block *block) {
         if(type==1 && block->read_only)result=1;
         if(sector>block->disk_size/512)result=1;else offset=sector*512;
         uint8_t *status_byte=guest(chain[count-1].addr,1);
-        for(unsigned j=0;j+1<count;j++){
-            struct desc d=chain[j];
-            if(type==0||type==1){
-                if(d.len>block->disk_size || offset>block->disk_size-d.len)result=1;
-                if(!result){
-                    size_t done=0;
-                    while(done<d.len){
-                        ssize_t n=type==0?pread(block->diskfd,guest(d.addr,d.len)+done,d.len-done,offset+done):pwrite(block->diskfd,guest(d.addr,d.len)+done,d.len-done,offset+done);
-                        if(n<0&&errno==EINTR)continue;
-                        if(n<=0){
-                            result=1;
-                            if(type==1)latch_storage_error(block,n<0?errno:EIO);
-                            break;
-                        }
-                        done+=n;
-                        if(type==0)block->read_bytes+=(uint64_t)n;else block->write_bytes+=(uint64_t)n;
-                    }
-                    if(type==0)written+=done;
+        if(type==0 || type==1){
+            // The descriptor chain and complete disk range are checked before
+            // the first host I/O. Empty segments need no iovec entry.
+            if(transferred>block->disk_size || offset>block->disk_size-transferred)result=1;
+            struct iovec iov[QSZ-1];int iovcnt=0;
+            if(!result)for(unsigned j=0;j+1<count;j++)if(chain[j].len){
+                iov[iovcnt].iov_base=guest(chain[j].addr,chain[j].len);
+                iov[iovcnt++].iov_len=chain[j].len;
+            }
+            size_t done=0;int next=0;
+            while(!result && next<iovcnt){
+                ssize_t n=type==0?preadv(block->diskfd,iov+next,iovcnt-next,offset+done):
+                                   pwritev(block->diskfd,iov+next,iovcnt-next,offset+done);
+                if(n<0 && errno==EINTR)continue;
+                if(n<=0){
+                    result=1;
+                    if(type==1)latch_storage_error(block,n<0?errno:EIO);
+                    break;
                 }
-                offset+=d.len;
-            }else result=2;
-        }
+                done+=(size_t)n;
+                if(type==0)block->read_bytes+=(uint64_t)n;else block->write_bytes+=(uint64_t)n;
+                size_t consumed=(size_t)n;
+                while(next<iovcnt && consumed>=iov[next].iov_len){
+                    consumed-=iov[next].iov_len;next++;
+                }
+                if(consumed){
+                    iov[next].iov_base=(uint8_t *)iov[next].iov_base+consumed;
+                    iov[next].iov_len-=consumed;
+                }
+            }
+            if(type==0)written+=done;
+        }else if(count>1)result=2;
         // FLUSH has header and block->status only; perform it before publishing completion.
         if(type==4 && !block->read_only){
             if(block->storage_errno)result=1;

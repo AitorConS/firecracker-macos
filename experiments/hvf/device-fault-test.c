@@ -14,6 +14,7 @@
 #include <stdatomic.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <sys/uio.h>
 static const char *fault_case;
 static uint8_t *fixture;
 static unsigned read_calls,write_calls,flush_calls,fsync_calls;
@@ -31,21 +32,24 @@ static const uint8_t *flush_status;
 struct wire_desc{uint64_t addr;uint32_t len;uint16_t flags,next;};
 static int is(const char *name){return !strcmp(fault_case,name);}
 static void note(char c){if(trace_len+1<sizeof(trace))trace[trace_len++]=c;}
-static ssize_t injected_read(int fd,void *buffer,size_t count,off_t offset){
+static ssize_t injected_readv(int fd,const struct iovec *iov,int count,off_t offset){
     read_calls++;note('R');
     if(is("eof"))return 0;
     if(is("descriptor-edit") && read_calls==1){
         struct wire_desc *descriptors=(void *)(fixture+DESC);
         descriptors[1].addr=UINT64_MAX;descriptors[1].len=UINT32_MAX;
         descriptors[2].addr=UINT64_MAX;
+        descriptors[200].addr=UINT64_MAX;descriptors[200].len=UINT32_MAX;
         memset(fixture+0x20000,0xff,16);
     }
-    return pread(fd,buffer,short_io&&count>7?7:count,offset);
+    if(short_io){struct iovec first=*iov;if(first.iov_len>7)first.iov_len=7;return preadv(fd,&first,1,offset);}
+    return preadv(fd,iov,count,offset);
 }
-static ssize_t injected_write(int fd,const void *buffer,size_t count,off_t offset){
+static ssize_t injected_writev(int fd,const struct iovec *iov,int count,off_t offset){
     write_calls++;note('W');
     if(write_calls<16 && write_errno[write_calls]){errno=write_errno[write_calls];return -1;}
-    return pwrite(fd,buffer,short_io&&count>7?7:count,offset);
+    if(short_io){struct iovec first=*iov;if(first.iov_len>7)first.iov_len=7;return pwritev(fd,&first,1,offset);}
+    return pwritev(fd,iov,count,offset);
 }
 static int injected_fullsync(int fd,int command,...){
     assert(command==F_FULLFSYNC);flush_calls++;note('F');
@@ -56,16 +60,16 @@ static int injected_fullsync(int fd,int command,...){
 }
 // Counts any weaker fallback; production code must never call fsync().
 static int injected_fsync(int fd){fsync_calls++;note('S');return fsync(fd);}
-#define pread injected_read
-#define pwrite injected_write
+#define preadv injected_readv
+#define pwritev injected_writev
 #define fcntl injected_fullsync
 #define fsync injected_fsync
 #ifndef DEVICES_C
 #define DEVICES_C "../../src/hvf-vmm/native/devices.c"
 #endif
 #include DEVICES_C
-#undef pread
-#undef pwrite
+#undef preadv
+#undef pwritev
 #undef fcntl
 #undef fsync
 static unsigned submitted;
@@ -90,6 +94,13 @@ static unsigned submit(uint32_t type,uint64_t sector,uint8_t fill){
     uint16_t idx=submitted;memcpy(fixture+AVAIL+2,&idx,2);
     return k;
 }
+static void split_data(unsigned k,uint32_t second_len){
+    struct wire_desc *d=(void *)(fixture+DESC);
+    uint16_t first=3*k+1,extra=200;
+    assert(d[extra].len==0);
+    d[first].len=256;d[first].next=extra;
+    d[extra]=(struct wire_desc){d[first].addr+256,second_len,d[first].flags,3*k+2};
+}
 static void kick(void){write_reg(16,2,0);}
 static uint8_t status(unsigned k){return fixture[STATUS+k];}
 static uint16_t used_idx(void){uint16_t v;memcpy(&v,fixture+USED+2,2);return v;}
@@ -108,8 +119,15 @@ int main(int argc,char **argv){
     write_reg(18,1,7);write_reg(8,4,(BASE+DESC)>>12);
     uint64_t c[4];int closed=0;
     if(is("short-read")||is("descriptor-edit")){
-        short_io=1;submit(0,0,0);kick();
+        short_io=1;unsigned k=submit(0,0,0);
+        if(is("descriptor-edit"))split_data(k,256);
+        kick();
         assert(status(0)==0 && read_calls>1 && !memcmp(pattern,data(0),512));
+        devices_metrics(c);assert(c[1]==512 && c[3]==0);
+    }else if(is("vector-read")||is("vector-short-read")){
+        short_io=is("vector-short-read");unsigned k=submit(0,0,0);split_data(k,256);kick();
+        assert(status(k)==0 && !memcmp(pattern,data(k),512));
+        assert(read_calls==(short_io?74U:1U));
         devices_metrics(c);assert(c[1]==512 && c[3]==0);
     }else if(is("eof")){
         submit(0,0,0);kick();assert(status(0)==1);
@@ -119,6 +137,14 @@ int main(int argc,char **argv){
         short_io=1;submit(1,0,0xa5);kick();
         assert(status(0)==0 && write_calls>1);expect_sector(fd,0,0xa5);
         devices_metrics(c);assert(c[2]==512);
+    }else if(is("vector-write")||is("vector-short-write")){
+        short_io=is("vector-short-write");unsigned k=submit(1,0,0xa5);split_data(k,256);kick();
+        assert(status(k)==0 && write_calls==(short_io?74U:1U));expect_sector(fd,0,0xa5);
+        devices_metrics(c);assert(c[2]==512 && c[3]==0);
+    }else if(is("vector-range")){
+        unsigned k=submit(1,15,0xa5);split_data(k,512);kick();
+        assert(status(k)==1 && write_calls==0);expect_sector(fd,15,0);
+        submit(4,0,0);kick();assert(status(1)==0 && flush_calls==1);
     }else if(is("write-eintr")){
         write_errno[1]=EINTR;submit(1,0,0xa6);submit(4,0,0);kick();
         assert(status(0)==0 && status(1)==0 && write_calls==2 && flush_calls==1);expect_sector(fd,0,0xa6);

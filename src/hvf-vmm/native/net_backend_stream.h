@@ -87,16 +87,20 @@ static void stream_poll(void) {
     }
     stream_flush();
     for(unsigned budget=0;budget<256 && stream.fd>=0;budget++){
-        ssize_t n=recv(stream.fd,stream.rx+stream.used,stream.need-stream.used,0);
-        if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR))return;
-        if(n<=0){stream_disconnect();return;}stream.used+=(size_t)n;stream.progress=stream_ms();
+        if(stream.used<stream.need){
+            ssize_t n=recv(stream.fd,stream.rx+stream.used,stream.need-stream.used,0);
+            if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR))return;
+            if(n<=0){stream_disconnect();return;}stream.used+=(size_t)n;stream.progress=stream_ms();
+        }
         if(stream.used!=stream.need)continue;
         if(stream.need==4){
             uint32_t size=0;for(unsigned i=0;i<4;i++)size=(size<<8)|stream.rx[i];
             if(size<14||size>STREAM_FRAME){stream_disconnect();return;}
             stream.need=size+4;
         }else{
-            (void)stream.receive(stream.rx+4,stream.need-4,NULL);
+            // The broker IPC socket may be full. Retain this complete frame
+            // and stop reading the ordered stream until it can be delivered.
+            if(stream.receive(stream.rx+4,stream.need-4,NULL)<0)return;
             stream.need=4;stream.used=0;
         }
     }

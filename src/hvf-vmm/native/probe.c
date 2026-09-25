@@ -403,6 +403,7 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
     unsigned phase=options->restore?3:0;
     uint64_t transition=0, paused_ticks=options->restore?restore_started:0;
     double transition_deadline=0;
+    unsigned network_hot_polls=0;
     while(atomic_load(&result)<0) {
         if(stop_requested)finish(128+stop_requested);
         if(options->ready_fd>=0){
@@ -431,7 +432,8 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
         }
         if(phase==1)kick_cpus(); // Repeat: a CPU can enter hv_vcpu_run after an earlier kick.
         pthread_mutex_lock(&io_lock);
-        if(phase<3){devices_poll();net_poll();}else net_backend_health();
+        int network_active=0;
+        if(phase<3){devices_poll();network_active=net_poll();}else net_backend_health();
         if(phase==1 && parked_cpus()==(int)ncpus && !devices_pending() && !net_pending_tx()){
             paused_ticks=mach_absolute_time();
             net_backend_pause(1,transition);phase=2;
@@ -472,7 +474,11 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
         }
         pthread_mutex_unlock(&io_lock);
         if(options->timeout_ms && seconds()>=deadline){fprintf(stderr,"HVF: watchdog deadline\n");finish(124);}
-        usleep(1000);
+        // Guest TX notifications and broker RX are polled here. Keep the
+        // network responsive during a burst without spinning while idle.
+        if(phase==0 && network_active)network_hot_polls=20;
+        else if(network_hot_polls)network_hot_polls--;
+        usleep(phase==0 && network_hot_polls?100:1000);
     }
     pthread_mutex_lock(&state_lock);pthread_cond_broadcast(&state_change);pthread_mutex_unlock(&state_lock);
     // A canceled exit wakes sleeping/running CPUs so all can join teardown.

@@ -57,7 +57,7 @@ static void complete(struct queue *q,uint16_t h,uint32_t n){
 static ssize_t receive(const void *buf,size_t len,void *opaque){
     (void)opaque;
     struct queue *q=&queues[0];
-    if(!pending(q)){drop_packets++;drop_bytes+=len;return len;} // allow protocol retransmission when RX ring is empty
+    if(!pending(q)){errno=EAGAIN;return -1;} // IPC retains one frame until the guest replenishes RX
     if(len>65536-10)die("oversized frame");
     if(!budget_take(&network_budget,len,1)){errno=EAGAIN;return -1;}
     uint8_t frame[65536]={0};memcpy(frame+10,buf,len);size_t total=len+10,done=0;
@@ -83,7 +83,10 @@ static void transmit(void){
         }
         if(len<24 || frame[0] || frame[1])die("TX header/offload unsupported");
         if(!budget_take(&network_budget,len-10,1))break;
-        complete(q,h,0);net_backend_send(frame+10,len-10);tx++;tx_bytes+=len-10;
+        // A full broker socket is backpressure, not packet loss. Leave this
+        // descriptor available and retry it on the next supervisor poll.
+        if(!net_backend_send(frame+10,len-10))break;
+        complete(q,h,0);tx++;tx_bytes+=len-10;
     }
 }
 int net_init(void *memory,size_t size,const struct hvf_options *options){
@@ -126,7 +129,12 @@ int net_mmio(uint64_t addr,unsigned size,int write,uint64_t *v){
     }}return 1;
 }
 int net_pending_tx(void){return enabled && pending(&queues[1]);}
-void net_poll(void){if(enabled){transmit();net_backend_poll();}}
+int net_poll(void){
+    if(!enabled)return 0;
+    unsigned long before_tx=tx,before_rx=rx;
+    transmit();net_backend_poll();
+    return tx!=before_tx||rx!=before_rx;
+}
 void net_close(void){if(enabled){fprintf(stderr,"network: TX=%lu RX=%lu\n",tx,rx);net_backend_close();enabled=0;}}
 
 // Caller holds the device I/O lock. RX drops count empty rings; rate limiting defers one bounded IPC frame.

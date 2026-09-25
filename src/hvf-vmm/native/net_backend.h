@@ -4,7 +4,8 @@
 #include "hvf.h"
 typedef ssize_t (*net_receive_fn)(const void *,size_t,void *);
 int net_backend_open(const struct hvf_options *,net_receive_fn);
-void net_backend_send(const void *,size_t);
+// Returns 0 if the broker socket is full; the caller must retain and retry the frame.
+int net_backend_send(const void *,size_t);
 void net_backend_poll(void);
 void net_backend_close(void);
 int net_backend_pid(void);

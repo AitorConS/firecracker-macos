@@ -273,10 +273,10 @@ automatically granted executable file. A boot without network access uses
     "rss_mib": 3072,
     "cpu_seconds": 86400,
     "nice": 5,
-    "disk_bytes_per_second": 268435456,
-    "disk_operations_per_second": 20000,
-    "network_bytes_per_second": 67108864,
-    "network_packets_per_second": 100000
+    "disk_bytes_per_second": 8589934592,
+    "disk_operations_per_second": 250000,
+    "network_bytes_per_second": 0,
+    "network_packets_per_second": 0
   }
 }
 ```
@@ -302,9 +302,15 @@ explicit `"security": {"version": 1, "mode": "development"}`.
 `GET /capabilities` distinguishes effective isolation and available limits.
 Aggregate group RSS and CPU are reactive, sampled every 100 ms. RLIMIT_CPU
 is not supported with HVF on the validated host; it only applies to network processes.
-I/O limiters act on devices, with disk bursts of 4 MiB/32
-operations and network bursts of 256 KiB/256 packets. They are not equivalent to cgroups or kernel network
-quotas. `--no-api` also keeps a private supervisor.
+I/O limiters act on devices, with disk bursts of at least 4 MiB/32 operations
+and network bursts of at least 256 KiB/256 packets. The burst capacity grows
+to hold one millisecond of tokens when a higher configured rate requires it.
+Network rates default to zero, meaning
+unlimited; set either `network_bytes_per_second` (1 MiB/s..1 TiB/s) or
+`network_packets_per_second` (1..1000000 packets/s) to cap that dimension
+independently. Explicit caps still use the same bounded bursts and are not
+equivalent to cgroups or kernel network quotas. `--no-api` also keeps a private
+supervisor.
 
 Input files must be regular; final symlinks are rejected.
 The supervisor locks and prepares the files, and passes the open disks.

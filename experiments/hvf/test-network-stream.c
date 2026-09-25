@@ -5,8 +5,11 @@
 #include <stdlib.h>
 #include "net_backend_stream.h"
 static unsigned received;
+static int blocked;
 static ssize_t deliver(const void *data,size_t size,void *unused){
-    (void)unused;assert(size==14 || size==STREAM_FRAME);assert(((const uint8_t*)data)[0]==42);received++;return size;
+    (void)unused;assert(size==14 || size==STREAM_FRAME);assert(((const uint8_t*)data)[0]==42);
+    if(blocked){errno=EAGAIN;return -1;}
+    received++;return size;
 }
 static int pair(void){
     int fds[2];assert(socketpair(AF_UNIX,SOCK_STREAM,0,fds)==0);
@@ -18,6 +21,8 @@ int main(void){
     int peer=pair();uint8_t frame[18]={0,0,0,14,42};
     for(unsigned i=0;i<18;i++){assert(write(peer,frame+i,1)==1);stream_poll();assert(received==(i==17));}
     assert(write(peer,frame,18)==18);assert(write(peer,frame,18)==18);stream_poll();assert(received==3);
+    blocked=1;assert(write(peer,frame,18)==18);stream_poll();assert(received==3);
+    assert(stream.used==stream.need);blocked=0;stream_poll();assert(received==4);
     for(unsigned i=0;i<300;i++)stream_send(frame+4,14);
     uint8_t data[8192];ssize_t n=read(peer,data,sizeof(data));assert(n>0 && n%18==0);
     for(ssize_t i=0;i<n;i+=18)assert(!memcmp(data+i,frame,18));
@@ -28,7 +33,7 @@ int main(void){
         assert(write(peer,h,4)==4);stream_poll();assert(stream.fd==-1);close(peer);
     }
     peer=pair();uint8_t *large=calloc(1,STREAM_FRAME+4);assert(large);large[1]=1;large[4]=42;
-    for(unsigned offset=0;offset<STREAM_FRAME+4;){unsigned size=STREAM_FRAME+4-offset;if(size>1024)size=1024;assert(write(peer,large+offset,size)==size);offset+=size;stream_poll();}assert(received==4);free(large);close(peer);stream_disconnect();
+    for(unsigned offset=0;offset<STREAM_FRAME+4;){unsigned size=STREAM_FRAME+4-offset;if(size>1024)size=1024;assert(write(peer,large+offset,size)==size);offset+=size;stream_poll();}assert(received==5);free(large);close(peer);stream_disconnect();
     peer=pair();assert(write(peer,frame,2)==2);stream_poll();assert(stream.used==2);close(peer);stream_poll();assert(stream.used==0);
     // Force partial writes and a full queue; the next frame must be dropped
     // whole while the outstanding length-prefixed frame remains intact.
@@ -50,7 +55,7 @@ int main(void){
     assert(bind(listener,(struct sockaddr*)&addr,sizeof(addr))==0);assert(listen(listener,1)==0);
     stream.path=path;stream.retry=0;assert(chmod(path,0666)==0);struct hvf_options options={.stream_path=path};assert(stream_open(&options,deliver)==-1);assert(stream.fd==-1);
     assert(chmod(path,0600)==0);stream.retry=0;stream_connect();assert(stream.fd>=0);peer=accept(listener,NULL,NULL);assert(peer>=0);
-    assert(write(peer,frame,18)==18);stream_poll();assert(received==5);close(peer);stream_poll();assert(stream.fd==-1);
+    assert(write(peer,frame,18)==18);stream_poll();assert(received==6);close(peer);stream_poll();assert(stream.fd==-1);
     stream.retry=0;stream_connect();assert(stream.fd>=0);peer=accept(listener,NULL,NULL);assert(peer>=0);
     close(peer);close(listener);stream_disconnect();unlink(path);rmdir(dir);
     puts("PASS stream: split/coalesced frames, bounds, EOF reset, TX framing, private sockets and reconnect");

@@ -28,12 +28,18 @@ static pid_t broker=-1;
 static struct control_reader health_reader;
 static uint64_t pause_operation, pause_ack;
 static net_receive_fn receive_frame;
+static int broker_stream;
 static void fail(const char *message){fprintf(stderr,"network IPC: %s\n",message);exit(2);}
 static ssize_t broker_deliver(const void *data,size_t size,void *opaque){
     (void)opaque;
     ssize_t n=send(frames,data,size,MSG_DONTWAIT);
-    // Bounded datagram queues may drop under load; protocols can retransmit.
-    if(n<0 && (errno==EAGAIN||errno==EWOULDBLOCK||errno==ENOBUFS)){rx_drops++;rx_drop_bytes+=size;return (ssize_t)size;}return n;
+    if(n<0 && (errno==EAGAIN||errno==EWOULDBLOCK||errno==ENOBUFS)){
+        // Unix-stream transport can retry its retained frame. libslirp has
+        // no equivalent backpressure contract, so preserve its drop policy.
+        if(broker_stream){errno=EAGAIN;return -1;}
+        rx_drops++;rx_drop_bytes+=size;return (ssize_t)size;
+    }
+    return n;
 }
 static void broker_main(const struct hvf_options *options){
     if(net_forget_guest_memory())_exit(2);
@@ -49,6 +55,7 @@ static void broker_main(const struct hvf_options *options){
     if(dup2(STDERR_FILENO,STDOUT_FILENO)<0)_exit(2);
     hvf_policy_set(options->security);
     int is_stream=options->stream_path!=NULL;
+    broker_stream=is_stream;
     if(options->security && !options->security->development &&
        ((!is_stream && hvf_gate_start()) || hvf_sandbox_install(options->security->broker_profile))){
         (void)control_send(health,'E',0);_exit(2);
@@ -69,8 +76,15 @@ static void broker_main(const struct hvf_options *options){
             if(send(stats,packet,sizeof(packet),MSG_DONTWAIT)!=(ssize_t)sizeof(packet))stats_drops++;next_stats=ms+100;
         }
         if(!is_stream && hvf_gate_check()){fprintf(stderr,"socket authority disconnected\n");_exit(2);}
-        struct pollfd fds[2]={{health,POLLIN,0},{frames,POLLIN,0}};
-        int result=poll(fds,2,1);
+        // Wake for Unix-stream traffic directly. Polling only the supervisor
+        // sockets added a fixed 1 ms delay to every guest/host exchange.
+        short stream_events=0;
+        if(is_stream && stream.fd>=0){
+            if(stream.used<stream.need)stream_events|=POLLIN;
+            if(stream.queued)stream_events|=POLLOUT;
+        }
+        struct pollfd fds[3]={{health,POLLIN,0},{frames,POLLIN,0},{stream.fd,stream_events,0}};
+        int result=poll(fds,is_stream && stream.fd>=0?3:2,1);
         if(result<0&&errno!=EINTR)break;
         if(fds[0].revents){
             uint8_t kind;uint64_t operation;
@@ -93,6 +107,7 @@ static void broker_main(const struct hvf_options *options){
         }
         if(paused){usleep(1000);continue;}
         for(unsigned budget=0;budget<256;budget++){
+            if(is_stream){stream_flush();if(stream.queued)break;}
             ssize_t n=recv(frames,packet,sizeof(packet),MSG_DONTWAIT);
             if(n<0){if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)goto done;break;}
             if(n<14||n>65536)goto done;
@@ -124,8 +139,13 @@ int net_backend_open(const struct hvf_options *options,net_receive_fn receive){
     if(poll(&ready,1,3000)>0 && control_receive(health,&reader,&kind,&operation)==1 && kind=='B' && operation==0)return 0;
     net_backend_close();return -1;
 }
-void net_backend_send(const void *data,size_t size){
-    if(send(frames,data,size,MSG_DONTWAIT)<0){if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=ENOBUFS)fail("broker send failed");tx_drops++;tx_drop_bytes+=size;}
+int net_backend_send(const void *data,size_t size){
+    ssize_t sent;
+    do {sent=send(frames,data,size,MSG_DONTWAIT);} while(sent<0&&errno==EINTR);
+    if(sent==(ssize_t)size)return 1;
+    if(sent<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==ENOBUFS))return 0;
+    fail("broker send failed");
+    return 0;
 }
 void net_backend_poll(void){
     uint8_t packet[65537];

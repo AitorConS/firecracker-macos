@@ -221,7 +221,7 @@ static int block_mmio(struct block *block,uint64_t addr,unsigned size,int write,
     uint64_t off=addr-base;
     if(write) {
         switch(off) {
-        case 4: if(size!=4) return 0; block->guest_features=*v; if(block->guest_features & ~((1U<<9)|(block->read_only?(1U<<5):0))) return 0; break;
+        case 4: if(size!=4) return 0; block->guest_features=*v; if(block->guest_features & ~((1U<<2)|(1U<<9)|(block->read_only?(1U<<5):0))) return 0; break;
         case 8: if(size!=4 || block->qsel) return 0; block->pfn=*v; block->last_avail=block->used_idx=0; break;
         case 14: if(size!=2) return 0; block->qsel=*v; break;
         case 16: if(size!=2 || *v) return 0; notify(block); break;
@@ -230,13 +230,16 @@ static int block_mmio(struct block *block,uint64_t addr,unsigned size,int write,
         }
     } else {
         switch(off) {
-        case 0: *v=(1U<<9)|(block->read_only?(1U<<5):0); break; // FLUSH
+        case 0: *v=(1U<<2)|(1U<<9)|(block->read_only?(1U<<5):0); break; // SEG_MAX, FLUSH
         case 4: *v=block->guest_features; break;
         case 8: *v=block->qsel?0:block->pfn; break;
         case 12: *v=block->qsel?0:QSZ; break;
         case 14: *v=block->qsel; break;
         case 18: *v=block->status; break;
         case 19: *v=block->isr;block->isr=0;irq(block,0);break;
+        // Legacy device config begins at byte 20; seg_max is at offset 12.
+        // Reserve one ring descriptor each for the header and status byte.
+        case 32: if(size!=4)return 0; *v=QSZ-2; break;
         default:
             if(off>=20 && off+size<=28) *v=(block->disk_size/512)>>((off-20)*8);
             else return 0;

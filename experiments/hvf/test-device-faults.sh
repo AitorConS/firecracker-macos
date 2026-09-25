@@ -10,7 +10,7 @@ compile() { # output [extra flags]
         -Iexperiments/hvf/fuzz/stubs -Isrc/hvf-vmm/native experiments/hvf/device-fault-test.c -o "$out"
 }
 run_case() { ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 "$@"; }
-cases="short-read short-write vector-read vector-write vector-short-read vector-short-write
+cases="advertised-segments short-read short-write vector-read vector-write vector-short-read vector-short-write
 vector-range write-eintr descriptor-edit io-error no-space eof flush-error
 flush-unsupported flush-eintr flush-success flush-sticky ordering flush-readonly
 snapshot-latched close-flush close-latched"

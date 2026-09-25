@@ -112,13 +112,32 @@ static void expect_sector(int fd,uint64_t sector,uint8_t fill){
 }
 int main(int argc,char **argv){
     assert(argc==2);fault_case=argv[1];fixture=calloc(1,1<<20);assert(fixture);
-    char path[]="/tmp/hvf-fault-XXXXXX";int fd=mkstemp(path);assert(fd>=0);unlink(path);assert(!ftruncate(fd,8192));
+    char path[]="/tmp/hvf-fault-XXXXXX";int fd=mkstemp(path);assert(fd>=0);unlink(path);assert(!ftruncate(fd,is("advertised-segments")?(QSZ-2)*512:8192));
     uint8_t pattern[512];for(unsigned i=0;i<512;i++)pattern[i]=(uint8_t)i;assert(pwrite(fd,pattern,512,0)==512);
     struct hvf_drive drive={.fd=fd,.read_only=is("flush-readonly")};
     struct hvf_options config={.drive_count=1,.drives=&drive};assert(!devices_init(fixture,1<<20,NULL,&config));
     write_reg(18,1,7);write_reg(8,4,(BASE+DESC)>>12);
     uint64_t c[4];int closed=0;
-    if(is("short-read")||is("descriptor-edit")){
+    if(is("advertised-segments")){
+        uint64_t features=0,segments=0;
+        assert(devices_mmio(BAR,4,0,&features));assert(features&(1U<<2));
+        write_reg(4,4,features);
+        assert(devices_mmio(BAR+32,4,0,&segments));assert(segments==QSZ-2);
+        struct wire_desc *d=(void *)(fixture+DESC);
+        uint32_t type=1;memcpy(fixture+0x20000,&type,4);
+        d[0]=(struct wire_desc){BASE+0x20000,16,1,1};
+        for(unsigned j=0;j<segments;j++){
+            uint64_t address=0x60000+1024*j;
+            memset(fixture+address,j%251,512);
+            d[j+1]=(struct wire_desc){BASE+address,512,1,j+2};
+        }
+        fixture[STATUS]=0xff;
+        d[QSZ-1]=(struct wire_desc){BASE+STATUS,1,2,0};
+        uint16_t idx=1;memcpy(fixture+AVAIL+2,&idx,2);kick();
+        assert(status(0)==0 && used_idx()==1 && write_calls==1);
+        for(unsigned j=0;j<segments;j++)expect_sector(fd,j,j%251);
+        devices_metrics(c);assert(c[2]==segments*512 && c[3]==0);
+    }else if(is("short-read")||is("descriptor-edit")){
         short_io=1;unsigned k=submit(0,0,0);
         if(is("descriptor-edit"))split_data(k,256);
         kick();

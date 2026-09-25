@@ -404,3 +404,9 @@ produces an `8h` sample, which never accredits 24h acceptance.
 It prevents idle sleep only while running.
 
 The default RSS group ceiling is 5120 MiB: on macOS HVF a fully touched 2 GiB guest can be charged about 4 GiB by the resident-memory ledger, plus VMM/broker overhead. Explicit `rss_mib` limits remain unchanged and can intentionally terminate such a guest.
+
+The legacy block device advertises `VIRTIO_BLK_F_SEG_MAX` with 254 data segments
+(the 256-entry queue reserves a header and a status descriptor). The existing
+4 MiB total-request limit, validated descriptor snapshot and durable flush
+semantics still apply. This lets guests submit fragmented writeback through
+one positional vectored host operation instead of one operation per fragment.

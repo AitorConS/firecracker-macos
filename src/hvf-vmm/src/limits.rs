@@ -33,7 +33,11 @@ impl Default for Limits {
             open_files: 1024,
             file_size_bytes: 16 << 30,
             cpu_seconds: 86400,
-            rss_mib: 3072,
+            // HVF charges resident guest mappings in both host and hypervisor
+            // ledgers on macOS. A fully touched 2 GiB guest can report ~4 GiB
+            // RSS; retain another GiB for the VMM/broker and transient buffers.
+            // Explicit rss_mib values are still enforced without adjustment.
+            rss_mib: 5120,
             nice: 5,
             // Device budgets should permit modern local storage by default;
             // operators can still set lower explicit byte and IOPS limits.
@@ -230,6 +234,15 @@ mod tests {
         limits.validate().unwrap();
         limits.network_packets_per_second = 1000001;
         assert!(limits.validate().is_err());
+    }
+
+    #[test]
+    fn default_rss_covers_maximum_guest_mappings() {
+        let limits = Limits::default();
+        assert_eq!(limits.rss_mib, 2 * 2048 + 1024);
+        let explicit: Limits = serde_json::from_str(r#"{"rss_mib":64}"#).unwrap();
+        explicit.validate().unwrap();
+        assert_eq!(Watchdog::new(&explicit).budget, 64 << 20);
     }
 
     #[test]

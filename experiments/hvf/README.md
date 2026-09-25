@@ -270,7 +270,7 @@ automatically granted executable file. A boot without network access uses
     "version": 1,
     "open_files": 1024,
     "file_size_bytes": 17179869184,
-    "rss_mib": 3072,
+    "rss_mib": 5120,
     "cpu_seconds": 86400,
     "nice": 5,
     "disk_bytes_per_second": 8589934592,
@@ -402,3 +402,5 @@ effective seconds complete; a short test does not meet that criterion. The
 `sample_label` field identifies the target duration: `--seconds 28800 --interval 5`
 produces an `8h` sample, which never accredits 24h acceptance.
 It prevents idle sleep only while running.
+
+The default RSS group ceiling is 5120 MiB: on macOS HVF a fully touched 2 GiB guest can be charged about 4 GiB by the resident-memory ledger, plus VMM/broker overhead. Explicit `rss_mib` limits remain unchanged and can intentionally terminate such a guest.

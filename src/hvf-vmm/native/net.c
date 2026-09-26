@@ -67,7 +67,8 @@ static ssize_t receive(const void *buf,size_t len,void *opaque){
     if(!pending(q)){errno=EAGAIN;return -1;} // IPC retains one frame until the guest replenishes RX
     if(len>65536-10)die("oversized frame");
     if(!budget_take(&network_budget,len,1)){errno=EAGAIN;return -1;}
-    uint8_t frame[65536]={0};memcpy(frame+10,buf,len);size_t total=len+10,done=0;
+    // Only the virtio header needs clearing; memcpy initializes every payload byte copied below.
+    uint8_t frame[65536];memset(frame,0,10);memcpy(frame+10,buf,len);size_t total=len+10,done=0;
     uint16_t h=head(q),i=h;unsigned count=0;
     while(done<total){
         if(++count>QSZ)die("RX cycle");struct desc d=desc(q,i);

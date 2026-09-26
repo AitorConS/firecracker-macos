@@ -12,12 +12,15 @@
 #include <string.h>
 #include "net_backend.h"
 #define STREAM_FRAME 65536u
+#define STREAM_RX_CAPACITY (2u * (STREAM_FRAME + 4u))
 static struct {
     int fd, connecting, paused;
     const char *path;
     net_receive_fn receive;
-    uint8_t rx[STREAM_FRAME+4], tx[STREAM_FRAME+4];
-    size_t used, need, sent, queued;
+    uint8_t rx[STREAM_RX_CAPACITY], tx[STREAM_FRAME+4];
+    // used/need describe the current frame for the broker's blocked_rx check.
+    // rx_start/rx_used delimit buffered bytes; later frames remain in place.
+    size_t used, need, rx_start, rx_used, sent, queued;
     uint64_t retry, progress, tx_progress, drops, drop_bytes;
 } stream = {.fd=-1};
 static uint64_t stream_ms(void) {
@@ -26,7 +29,7 @@ static uint64_t stream_ms(void) {
 }
 static void stream_disconnect(void) {
     if(stream.fd>=0)close(stream.fd);
-    stream.fd=-1;stream.connecting=0;stream.used=0;stream.need=4;
+    stream.fd=-1;stream.connecting=0;stream.used=0;stream.need=4;stream.rx_start=stream.rx_used=0;
     if(stream.queued){stream.drops++;stream.drop_bytes+=stream.queued-4;}
     stream.queued=stream.sent=0;stream.retry=stream_ms()+1000;
 }
@@ -53,7 +56,7 @@ static void stream_connect(void) {
     }else if(!stream_peer())stream_disconnect();
 }
 static int stream_open(const struct hvf_options *options,net_receive_fn receive) {
-    stream.path=options->stream_path;stream.receive=receive;stream.need=4;
+    stream.path=options->stream_path;stream.receive=receive;stream.need=4;stream.used=0;stream.rx_start=stream.rx_used=0;
     stream_connect();return stream.fd<0?-1:0;
 }
 static void stream_flush(void) {
@@ -87,21 +90,33 @@ static void stream_poll(void) {
     }
     stream_flush();
     for(unsigned budget=0;budget<256 && stream.fd>=0;budget++){
-        if(stream.used<stream.need){
-            ssize_t n=recv(stream.fd,stream.rx+stream.used,stream.need-stream.used,0);
-            if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR))return;
-            if(n<=0){stream_disconnect();return;}stream.used+=(size_t)n;stream.progress=stream_ms();
-        }
-        if(stream.used!=stream.need)continue;
-        if(stream.need==4){
-            uint32_t size=0;for(unsigned i=0;i<4;i++)size=(size<<8)|stream.rx[i];
+        if(stream.need==4 && stream.rx_used>=4){
+            uint32_t size=0;for(unsigned i=0;i<4;i++)size=(size<<8)|stream.rx[stream.rx_start+i];
             if(size<14||size>STREAM_FRAME){stream_disconnect();return;}
             stream.need=size+4;
-        }else{
-            // The broker IPC socket may be full. Retain this complete frame
-            // and stop reading the ordered stream until it can be delivered.
-            if(stream.receive(stream.rx+4,stream.need-4,NULL)<0)return;
-            stream.need=4;stream.used=0;
         }
+        stream.used=stream.rx_used<stream.need?stream.rx_used:stream.need;
+        if(stream.used==stream.need){
+            // Keep used==need if the callback applies backpressure: the broker
+            // uses that condition to stop polling the stream socket for RX.
+            if(stream.receive(stream.rx+stream.rx_start+4,stream.need-4,NULL)<0)return;
+            stream.rx_start+=stream.need;
+            stream.rx_used-=stream.need;
+            if(!stream.rx_used)stream.rx_start=0;
+            stream.need=4;stream.used=0;
+            continue;
+        }
+        size_t tail_free=sizeof(stream.rx)-(stream.rx_start+stream.rx_used);
+        if(stream.rx_start && tail_free<STREAM_FRAME+4){
+            // Compact only when another maximum-sized frame will not fit.
+            // Normal draining of coalesced frames advances an offset only.
+            memmove(stream.rx,stream.rx+stream.rx_start,stream.rx_used);
+            stream.rx_start=0;tail_free=sizeof(stream.rx)-stream.rx_used;
+        }
+        if(!tail_free){stream_disconnect();return;}
+        ssize_t n=recv(stream.fd,stream.rx+stream.rx_start+stream.rx_used,tail_free,0);
+        if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR))return;
+        if(n<=0){stream_disconnect();return;}
+        stream.rx_used+=(size_t)n;stream.progress=stream_ms();
     }
 }

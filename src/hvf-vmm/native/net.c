@@ -16,6 +16,7 @@ static struct budget network_budget;
 #define BAR 0x10010000ULL
 #define ECAM 0x3f008000ULL
 #define QSZ 256
+#define VRING_AVAIL_F_NO_INTERRUPT 1u
 static int enabled;
 static uint8_t *ram;
 static size_t ram_size;
@@ -52,7 +53,13 @@ static void complete(struct queue *q,uint16_t h,uint32_t n){
     uint64_t used=(avail_addr(q)+4+2*QSZ+2+4095)&~4095ULL;
     put(dma(used+4+8*(q->used%QSZ),8),4,h);put(dma(used+8+8*(q->used%QSZ),4),4,n);
     atomic_thread_fence(memory_order_release);put(dma(used+2,2),2,++q->used);q->avail++;
-    isr=1;irq(1);
+    // EVENT_IDX is not offered by this device. A polling guest suppresses TX
+    // interrupts with avail.flags; it checks used.idx after re-enabling them.
+    // Order the used index before reading flags to preserve that handshake.
+    atomic_thread_fence(memory_order_seq_cst);
+    if(!(get(dma(avail_addr(q),2),2)&VRING_AVAIL_F_NO_INTERRUPT) && !isr){
+        isr=1;irq(1);
+    }
 }
 static ssize_t receive(const void *buf,size_t len,void *opaque){
     (void)opaque;
@@ -124,7 +131,7 @@ int net_mmio(uint64_t addr,unsigned size,int write,uint64_t *v){
         case 12:*v=q?QSZ:0;break;
         case 14:*v=selectq;break;
         case 18:*v=status;break;
-        case 19:*v=isr;isr=0;irq(0);break;
+        case 19:*v=isr;if(isr){isr=0;irq(0);}break;
         default:{if(off<20||off+size>26)return 0;*v=get(mac+(off-20),size);}
     }}return 1;
 }

@@ -22,6 +22,7 @@ static struct budget disk_budget;
 #define BAR 0x10000000ULL
 #define ECAM 0x3f000000ULL
 #define QSZ 256
+#define VRING_AVAIL_F_NO_INTERRUPT 1u
 static uint8_t *memory;
 static size_t memory_size;
 struct block {
@@ -48,9 +49,11 @@ static uint8_t panic_config[256];
 static uint32_t panic_bar=0x10020000;
 static void fail(const char *why) { fprintf(stderr,"device error: %s\n",why); exit(2); }
 static void irq(struct block *block,int level) {
-    block->irq_level=level;unsigned line=35+block->slot%4;int high=0;
+    unsigned line=35+block->slot%4;int was_high=0,high=0;
+    for(unsigned i=0;i<block_count;i++)if(35+blocks[i].slot%4==line)was_high|=blocks[i].irq_level;
+    block->irq_level=level;
     for(unsigned i=0;i<block_count;i++)if(35+blocks[i].slot%4==line)high|=blocks[i].irq_level;
-    if(hv_gic_set_spi(line,high)!=HV_SUCCESS)fail("GIC SPI");
+    if(high!=was_high && hv_gic_set_spi(line,high)!=HV_SUCCESS)fail("GIC SPI");
 }
 static uint64_t get(const void *p, unsigned size) { uint64_t v=0; memcpy(&v,p,size); return v; }
 static void put(void *p, unsigned size,uint64_t v) { memcpy(p,&v,size); }
@@ -163,7 +166,14 @@ static void notify(struct block *block) {
         put(guest(used+2,2),2,++block->used_idx);
         block->last_avail++; block->requests++;
     }
-    if(block->last_avail!=before){block->isr|=1; irq(block,1);}
+    if(block->last_avail!=before){
+        // EVENT_IDX is not offered. Publish used.idx before checking whether
+        // the guest has suppressed interrupts through avail.flags.
+        atomic_thread_fence(memory_order_seq_cst);
+        if(!(get(guest(avail,2),2)&VRING_AVAIL_F_NO_INTERRUPT) && !block->isr){
+            block->isr|=1;irq(block,1);
+        }
+    }
 }
 int devices_init(void *ram,size_t size,const char *disk,const struct hvf_options *options) {
     budget_init(&disk_budget,options->disk_bytes_per_second,options->disk_operations_per_second,4ULL<<20,32);

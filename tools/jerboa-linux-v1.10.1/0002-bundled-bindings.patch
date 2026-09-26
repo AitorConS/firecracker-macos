@@ -1,0 +1,46 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index bb62d53..82905f0 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -123,28 +123,12 @@ version = "1.4.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ace50bade8e6234aa140d9a2f552bbee1db4d353f69b8217bc503490fc1a9f26"
+ 
+-[[package]]
+-name = "aws-lc-fips-sys"
+-version = "0.12.13"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "bf12b67bc9c5168f68655aadb2a12081689a58f1d9b1484705e4d1810ed6e4ac"
+-dependencies = [
+- "bindgen 0.69.4",
+- "cc",
+- "cmake",
+- "dunce",
+- "fs_extra",
+- "libc",
+- "paste",
+-]
+-
+ [[package]]
+ name = "aws-lc-rs"
+ version = "1.10.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "cdd82dba44d209fddb11c190e0a94b78651f95299598e472215667417a03ff1d"
+ dependencies = [
+- "aws-lc-fips-sys",
+  "aws-lc-sys",
+  "mirai-annotations",
+  "paste",
+diff --git a/src/vmm/Cargo.toml b/src/vmm/Cargo.toml
+index c9a032e..b7e790a 100644
+--- a/src/vmm/Cargo.toml
++++ b/src/vmm/Cargo.toml
+@@ -12,7 +12,7 @@ bench = false
+ acpi_tables = { path = "../acpi-tables" } 
+ aes-gcm =  { version = "0.10.1", default-features = false, features = ["aes"] }
+ arrayvec = { version = "0.7.6", optional = true }
+-aws-lc-rs = { version = "1.10.0", features = ["bindgen"] }
++aws-lc-rs = { version = "1.10.0" }
+ base64 = "0.22.1"
+ bincode = "1.2.1"
+ bitflags = "2.6.0"

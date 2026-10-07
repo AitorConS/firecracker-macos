@@ -37,12 +37,12 @@ struct block {
     uint64_t read_bytes,write_bytes,errors;
     // First host write/flush errno. Once set, every later FLUSH fails.
     int storage_errno;
-    pthread_t worker[4];int workers_started,inflight,flushing,stop;
+    pthread_t worker[8];int workers_started,inflight,flushing,stop;
     pthread_cond_t wake,idle;
     uint64_t generation;
-    struct breq *current[4];      /* request taken per worker, until completed */
+    struct breq *current[8];      /* request taken per worker, until completed */
     uint64_t taken;
-    struct worker_arg { struct block *block; int index; } wargs[4];
+    struct worker_arg { struct block *block; int index; } wargs[8];
 };
 static struct block blocks[4];
 static unsigned block_count;
@@ -102,10 +102,14 @@ static void latch_storage_error(struct block *block,int error) {
 //  - FLUSH is a full barrier: it starts only when every request taken before
 //    it has completed, nothing new starts until it completes, and it is
 //    performed alone (F_FULLFSYNC, error latching unchanged);
-//  - a request overlapping the sectors of one in flight waits for it.
+//  - a request overlapping the sectors of one taken before it waits for it;
+//  - only small writes (<= 64 KiB) run alongside other requests: reads and
+//    larger writes wait for every request taken before them.
 // A queue reset or relocation waits until nothing is in flight; pause treats
 // requests in flight as pending.
+#ifndef WORKERS
 #define WORKERS 4
+#endif
 struct breq {
     uint64_t seq;               /* order taken from the ring */
     uint16_t head; uint8_t result; uint8_t *status_byte;
@@ -222,6 +226,12 @@ static int overlaps(struct block *block,struct breq *q,int self) {
     }
     return 0;
 }
+// Device lock held: is a request taken before q still in flight?
+static int earlier_inflight(struct block *block,struct breq *q,int self) {
+    for(int i=0;i<WORKERS;i++)
+        if(i!=self && block->current[i] && block->current[i]->seq<q->seq)return 1;
+    return 0;
+}
 static void *block_worker(void *arg) {
     struct worker_arg *wa=arg;
     struct block *block=wa->block;int self=wa->index;
@@ -248,6 +258,13 @@ static void *block_worker(void *arg) {
             while(block->inflight>1)pthread_cond_wait(&block->idle,&io_lock);
         }
         while(overlaps(block,q,self))pthread_cond_wait(&block->idle,&io_lock);
+        // Measured on macOS: overlapping small writes raises random-write
+        // throughput, while running reads or large writes side by side lowers
+        // both. Only small writes run alongside other requests.
+        // Wait for requests taken before this one only (strict order, so two
+        // such requests can never wait for each other).
+        if(!(q->type==1 && q->transferred<=(64U<<10)))
+            while(earlier_inflight(block,q,self))pthread_cond_wait(&block->idle,&io_lock);
         // More requests may be waiting: let another worker take the next one.
         if(!block->flushing)pthread_cond_signal(&block->wake);
         pthread_mutex_unlock(&io_lock);

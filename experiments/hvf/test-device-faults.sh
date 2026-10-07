@@ -39,6 +39,6 @@ mutant no-latch-write io-error 's/if(__atomic_load_n(\&block->storage_errno,__AT
 mutant fsync-fallback flush-unsupported 's/} while (result == -1 \&\& errno == EINTR);/} while (result == -1 \&\& errno == EINTR); if(result==-1)result=fsync(fd);/'
 mutant flush-ignored flush-error 's/else if(flush_disk(block->diskfd)){q->result=1;latch_storage_error(block,errno);}/else {}/'
 mutant publish-before-flush ordering 's/^        perform(block,q);$/        if(q->type==4){pthread_mutex_lock(\&io_lock);*q->status_byte=0;pthread_mutex_unlock(\&io_lock);} perform(block,q);/'
-mutant no-flush-barrier ordering 's/while(block->inflight>1)pthread_cond_wait/while(0)pthread_cond_wait/'
+mutant no-flush-barrier ordering 's/            block->flushing=1;/            block->flushing=0;/'
 mutant no-overlap-order overlap 's/while(overlaps(block,q,self))pthread_cond_wait/while(0 \&\& overlaps(block,q,self))pthread_cond_wait/'
 mutant no-close-flush close-flush 's/else if(flush_disk(b->diskfd))fprintf/else if(0)fprintf/'

@@ -481,6 +481,8 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
         usleep(phase==0 && network_hot_polls?100:1000);
     }
     pthread_mutex_lock(&state_lock);pthread_cond_broadcast(&state_change);pthread_mutex_unlock(&state_lock);
+    // Block workers raise interrupts: stop them while vCPUs and the GIC exist.
+    devices_stop();
     // A canceled exit wakes sleeping/running CPUs so all can join teardown.
     hv_vcpu_t ids[MAX_CPUS];for(unsigned i=0;i<ncpus;i++)ids[i]=cpus[i].id;
     CHECK(hv_vcpus_exit(ids,ncpus));

@@ -405,13 +405,18 @@ int devices_pending(void){
 }
 void devices_poll(void){for(unsigned i=0;i<block_count;i++)if(blocks[i].pfn && (blocks[i].status&4))notify(&blocks[i]);}
 int devices_exit_status(void){return guest_exit;}
-void devices_close(void) {
-    // Called without the device lock: stop and join the workers first.
+// Called without the device lock, while vCPUs and the GIC still exist: a
+// worker finishing a request raises its interrupt. Requests not yet taken
+// are abandoned; the VM is going away.
+void devices_stop(void) {
     for(unsigned i=0;i<block_count;i++)if(blocks[i].workers_started){
         pthread_mutex_lock(&io_lock);blocks[i].stop=1;pthread_cond_broadcast(&blocks[i].wake);pthread_mutex_unlock(&io_lock);
         for(int w=0;w<blocks[i].workers_started;w++)pthread_join(blocks[i].worker[w],NULL);
         blocks[i].workers_started=0;
     }
+}
+void devices_close(void) {
+    devices_stop();
     for(unsigned i=0;i<block_count;i++)if(blocks[i].diskfd>=0){
         struct block *b=&blocks[i];
         // A guest may exit without a final FLUSH; do not leave its last writes

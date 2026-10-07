@@ -35,8 +35,15 @@ struct wire_desc{uint64_t addr;uint32_t len;uint16_t flags,next;};
 static int is(const char *name){return !strcmp(fault_case,name);}
 static void note(char c){if(trace_len+1<sizeof(trace))trace[trace_len++]=c;}
 static pthread_mutex_t inject_lock=PTHREAD_MUTEX_INITIALIZER;
+static unsigned stress_seed;
+static unsigned stress_rand(void){
+    pthread_mutex_lock(&inject_lock);
+    stress_seed=stress_seed*1103515245u+12345u;unsigned r=stress_seed>>8;
+    pthread_mutex_unlock(&inject_lock);return r;
+}
 static ssize_t injected_readv(int fd,const struct iovec *iov,int count,off_t offset){
     pthread_mutex_lock(&inject_lock);read_calls++;note('R');pthread_mutex_unlock(&inject_lock);
+    if(is("stress"))usleep(stress_rand()%2000);
     if(is("eof"))return 0;
     if(is("descriptor-edit") && read_calls==1){
         struct wire_desc *descriptors=(void *)(fixture+DESC);
@@ -53,6 +60,7 @@ static ssize_t injected_writev(int fd,const struct iovec *iov,int count,off_t of
     unsigned call=++write_calls;note('W');
     pthread_mutex_unlock(&inject_lock);
     // Slow the first write so that an unordered FLUSH or overlapping write would overtake it.
+    if(is("stress"))usleep(stress_rand()%2000);
     // (keyed on the data of the first request, 0x11, whichever worker issues it)
     if((is("ordering")||is("overlap")) && iov[0].iov_len && *(uint8_t *)iov[0].iov_base==0x11)usleep(50000);
     if(call<16 && write_errno[call]){errno=write_errno[call];return -1;}
@@ -220,6 +228,28 @@ int main(int argc,char **argv){
         submit(1,4,0x11);submit(1,4,0x22);submit(1,5,0x33);kick();
         for(unsigned k=0;k<3;k++)assert(status(k)==0);
         expect_sector(fd,4,0x22);expect_sector(fd,5,0x33);
+    }else if(is("stress")){
+        // Random reads, writes and flushes over 4 sectors, completed by workers
+        // in any order: every read must return the last write taken before it,
+        // and the disk must end as the requests applied in ring order.
+        const char *e=getenv("STRESS_SEED");stress_seed=e?(unsigned)atoi(e):1;
+        unsigned seed=stress_seed;
+        uint8_t model[4];for(unsigned s2=0;s2<4;s2++)model[s2]=s2==0?0:0; // sector 0 holds the pattern
+        uint8_t expect_read[32];int is_read[32]={0};unsigned nreq=30;
+        unsigned r=seed;
+        for(unsigned k=0;k<nreq;k++){
+            r=r*1103515245u+12345u;unsigned kind=(r>>16)%10;
+            r=r*1103515245u+12345u;unsigned sec=1+(r>>16)%4;   // sectors 1..4 (sector 0 holds the pattern)
+            if(kind<5){uint8_t fill=(uint8_t)(1+k);submit(1,sec,fill);model[sec-1]=fill;}
+            else if(kind<9){submit(0,sec,0);is_read[k]=1;expect_read[k]=model[sec-1];}
+            else submit(4,0,0);
+        }
+        kick();
+        for(unsigned k=0;k<nreq;k++){
+            assert(status(k)==0);
+            if(is_read[k])for(unsigned i=0;i<512;i++)assert(data(k)[i]==expect_read[k]);
+        }
+        for(unsigned s2=0;s2<4;s2++)expect_sector(fd,1+s2,model[s2]);
     }else if(is("flush-readonly")){
         submit(4,0,0);submit(1,0,0x77);kick();
         assert(status(0)==0 && status(1)==1 && flush_calls==0 && write_calls==0);

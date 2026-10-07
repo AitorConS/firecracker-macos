@@ -37,12 +37,12 @@ struct block {
     uint64_t read_bytes,write_bytes,errors;
     // First host write/flush errno. Once set, every later FLUSH fails.
     int storage_errno;
-    pthread_t worker[8];int workers_started,inflight,flushing,stop;
+    pthread_t worker[16];int workers_started,inflight,flushing,stop;
     pthread_cond_t wake,idle;
     uint64_t generation;
-    struct breq *current[8];      /* request taken per worker, until completed */
+    struct breq *current[16];      /* request taken per worker, until completed */
     uint64_t taken;
-    struct worker_arg { struct block *block; int index; } wargs[8];
+    struct worker_arg { struct block *block; int index; } wargs[16];
 };
 static struct block blocks[4];
 static unsigned block_count;

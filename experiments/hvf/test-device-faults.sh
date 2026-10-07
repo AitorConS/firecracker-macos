@@ -18,6 +18,11 @@ compile "$build/device-fault-test"
 for test in $cases; do
     run_case "$build/device-fault-test" "$test"
 done
+# Randomized ordering stress: many seeds, completions in any order.
+for seed in $(seq 1 ${STRESS_SEEDS:-200}); do
+    STRESS_SEED=$seed run_case "$build/device-fault-test" stress >/dev/null || { echo "FAIL stress seed $seed" >&2; exit 1; }
+done
+echo "PASS stress ${STRESS_SEEDS:-200} seeds"
 
 # Negative controls: each mutant reintroduces one durability bug; the named
 # case must detect it. A surviving mutant means the test lost its power.

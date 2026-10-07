@@ -23,6 +23,11 @@ for seed in $(seq 1 ${STRESS_SEEDS:-200}); do
     STRESS_SEED=$seed run_case "$build/device-fault-test" stress >/dev/null || { echo "FAIL stress seed $seed" >&2; exit 1; }
 done
 echo "PASS stress ${STRESS_SEEDS:-200} seeds"
+# Host writeback pacing, with a small threshold so a test reaches it.
+compile "$build/device-fault-test-pace" -DPACE_BYTES=1024
+for test in pace pace-error flush-success io-error; do
+    run_case "$build/device-fault-test-pace" "$test"
+done
 
 # Negative controls: each mutant reintroduces one durability bug; the named
 # case must detect it. A surviving mutant means the test lost its power.
@@ -33,7 +38,7 @@ mutant() { # name case sed-expression
     if cmp -s src/hvf-vmm/native/devices.c "$src"; then
         echo "FAIL mutant $name did not change devices.c" >&2; exit 1
     fi
-    compile "$build/device-fault-mutants/$name" "-DDEVICES_C=\"$src\""
+    compile "$build/device-fault-mutants/$name" "-DDEVICES_C=\"$src\"" ${MUTANT_FLAGS:-}
     if run_case "$build/device-fault-mutants/$name" "$case" >"$build/device-fault-mutants/$name.log" 2>&1; then
         echo "FAIL mutant $name survived case $case" >&2; exit 1
     fi
@@ -47,3 +52,4 @@ mutant publish-before-flush ordering 's/^        perform(block,q);$/        if(q
 mutant no-flush-barrier ordering 's/            block->flushing=1;/            block->flushing=0;/'
 mutant no-overlap-order overlap 's/while(overlaps(block,q,self))pthread_cond_wait/while(0 \&\& overlaps(block,q,self))pthread_cond_wait/'
 mutant no-close-flush close-flush 's/else if(flush_disk(b->diskfd))fprintf/else if(0)fprintf/'
+MUTANT_FLAGS=-DPACE_BYTES=1024 mutant pace-error-ignored pace-error 's/if(result)latch_storage_error(block,errno);/if(0)latch_storage_error(block,errno);/'

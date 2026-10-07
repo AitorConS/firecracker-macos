@@ -42,6 +42,7 @@ struct block {
     uint64_t generation;
     struct breq *current[16];      /* request taken per worker, until completed */
     uint64_t taken;
+    uint64_t paced_bytes;          /* bytes written since the last writeback pace */
     struct worker_arg { struct block *block; int index; } wargs[16];
 };
 static struct block blocks[4];
@@ -110,12 +111,30 @@ static void latch_storage_error(struct block *block,int error) {
 #ifndef WORKERS
 #define WORKERS 4
 #endif
+// Host writeback pacing: after every PACE_BYTES of guest writes to a drive, a
+// plain fsync() starts host writeback of what has accumulated. Without it the
+// host keeps dirty data until the guest's next FLUSH, and that F_FULLFSYNC
+// then writes it all at once while every request waits (measured on macOS:
+// random 4K writes were bound by those stalls). fsync() here is not a
+// durability point and acknowledges nothing to the guest; FLUSH semantics are
+// unchanged. A failed fsync() is a host storage error and latches like one.
+#ifndef PACE_BYTES
+#define PACE_BYTES 67108864ULL  /* 64 MiB; 0 disables pacing */
+#endif
 struct breq {
     uint64_t seq;               /* order taken from the ring */
     uint16_t head; uint8_t result; uint8_t *status_byte;
     uint32_t type, written; uint64_t offset, transferred;
     int iovcnt; struct iovec iov[QSZ-1];
 };
+static void pace_writeback(struct block *block,const struct breq *q) {
+    if(!PACE_BYTES || q->type!=1 || q->result)return;
+    if(__atomic_add_fetch(&block->paced_bytes,q->transferred,__ATOMIC_SEQ_CST)<PACE_BYTES)return;
+    __atomic_store_n(&block->paced_bytes,0,__ATOMIC_SEQ_CST);
+    int result;
+    do result=fsync(block->diskfd); while(result==-1 && errno==EINTR);
+    if(result)latch_storage_error(block,errno);
+}
 // Device lock held. Validate and snapshot the next request; 0 when none can
 // be taken now (empty ring or rate budget exhausted).
 static int take(struct block *block,struct breq *q) {
@@ -269,6 +288,7 @@ static void *block_worker(void *arg) {
         if(!block->flushing)pthread_cond_signal(&block->wake);
         pthread_mutex_unlock(&io_lock);
         perform(block,q);
+        pace_writeback(block,q);
         pthread_mutex_lock(&io_lock);
         block->current[self]=NULL;
         block->inflight--;

@@ -21,7 +21,7 @@ static const char *fault_case;
 static uint8_t *fixture;
 static unsigned read_calls,write_calls,flush_calls,fsync_calls;
 static int short_io;
-static int write_errno[16],flush_errno[16];
+static int write_errno[16],flush_errno[16],fsync_errno;
 static char trace[64];
 static unsigned trace_len;
 static uint16_t used_at_flush=0xffff;
@@ -75,8 +75,13 @@ static int injected_fullsync(int fd,int command,...){
     if(flush_calls<16 && flush_errno[flush_calls]){errno=flush_errno[flush_calls];return -1;}
     return fcntl(fd,F_FULLFSYNC);
 }
-// Counts any weaker fallback; production code must never call fsync().
-static int injected_fsync(int fd){fsync_calls++;note('S');return fsync(fd);}
+// Counts fsync(): FLUSH must never be answered by it (no weaker fallback); it
+// is only issued by host writeback pacing, every PACE_BYTES of writes.
+static int injected_fsync(int fd){
+    pthread_mutex_lock(&inject_lock);fsync_calls++;note('S');pthread_mutex_unlock(&inject_lock);
+    if(fsync_errno){errno=fsync_errno;return -1;}
+    return fsync(fd);
+}
 #define preadv injected_readv
 #define pwritev injected_writev
 #define fcntl injected_fullsync
@@ -267,6 +272,20 @@ int main(int argc,char **argv){
     }else if(is("close-latched")){
         write_errno[1]=EIO;submit(1,3,0x44);kick();assert(status(0)==1);
         devices_close();closed=1;assert(flush_calls==0 && fsync_calls==0);
+    }else if(is("pace")){
+        // Built with PACE_BYTES=1024: the second 512-byte write paces host
+        // writeback with fsync(); FLUSH still issues F_FULLFSYNC.
+        assert(PACE_BYTES==1024);
+        submit(1,0,0x61);kick();assert(status(0)==0 && fsync_calls==0);
+        submit(1,1,0x62);kick();assert(status(1)==0 && fsync_calls==1 && flush_calls==0);
+        submit(4,0,0);kick();assert(status(2)==0 && flush_calls==1 && fsync_calls==1);
+        expect_sector(fd,0,0x61);expect_sector(fd,1,0x62);
+    }else if(is("pace-error")){
+        // A failed pacing fsync() is a host storage error: later FLUSHes fail.
+        assert(PACE_BYTES==1024);
+        fsync_errno=EIO;submit(1,0,0x61);submit(1,1,0x62);kick();
+        assert(status(0)==0 && status(1)==0 && fsync_calls==1);
+        submit(4,0,0);kick();assert(status(2)==1 && flush_calls==0);
     }else{
         fprintf(stderr,"unknown case %s\n",fault_case);return 2;
     }

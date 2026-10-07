@@ -14,6 +14,8 @@ static struct budget disk_budget;
 #include <string.h>
 #include <stdatomic.h>
 #include <errno.h>
+#include <pthread.h>
+#include <time.h>
 #ifdef HVF_CRASH_JOURNAL
 // Test-only power-loss journal (experiments/hvf/durability); never in releases.
 #include "crash_journal.h"
@@ -35,6 +37,12 @@ struct block {
     uint64_t read_bytes,write_bytes,errors;
     // First host write/flush errno. Once set, every later FLUSH fails.
     int storage_errno;
+    pthread_t worker[4];int workers_started,inflight,flushing,stop;
+    pthread_cond_t wake,idle;
+    uint64_t generation;
+    struct breq *current[4];      /* request taken per worker, until completed */
+    uint64_t taken;
+    struct worker_arg { struct block *block; int index; } wargs[4];
 };
 static struct block blocks[4];
 static unsigned block_count;
@@ -79,91 +87,190 @@ static int flush_disk(int fd) {
 // later successful F_FULLFSYNC would then acknowledge data that never reached
 // storage, so the first error is latched: FLUSH fails until the VMM restarts.
 static void latch_storage_error(struct block *block,int error) {
-    if(block->storage_errno)return;
-    block->storage_errno=error?error:EIO;
+    int expected=0;
+    if(!__atomic_compare_exchange_n(&block->storage_errno,&expected,error?error:EIO,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST))return;
     fprintf(stderr,"block[%u]: host storage error %d (%s); FLUSH fails until restart\n",
             (unsigned)(block-blocks),block->storage_errno,strerror(block->storage_errno));
 }
-static void notify(struct block *block) {
-    if(!(block->status&4) || !block->pfn) fail("queue used before ready");
+// Block requests run on a small pool of worker threads per drive, so a vCPU
+// exit never waits for host storage and independent requests overlap on the
+// host: notify() only wakes the workers. A worker takes one request at a
+// time under the global device I/O lock (validating its descriptor chain and
+// snapshotting it, as before), performs the host I/O without the lock, then
+// publishes its completion and the interrupt under the lock; completions may
+// be published out of order, which virtio allows. Ordering kept:
+//  - FLUSH is a full barrier: it starts only when every request taken before
+//    it has completed, nothing new starts until it completes, and it is
+//    performed alone (F_FULLFSYNC, error latching unchanged);
+//  - a request overlapping the sectors of one in flight waits for it.
+// A queue reset or relocation waits until nothing is in flight; pause treats
+// requests in flight as pending.
+#define WORKERS 4
+struct breq {
+    uint64_t seq;               /* order taken from the ring */
+    uint16_t head; uint8_t result; uint8_t *status_byte;
+    uint32_t type, written; uint64_t offset, transferred;
+    int iovcnt; struct iovec iov[QSZ-1];
+};
+// Device lock held. Validate and snapshot the next request; 0 when none can
+// be taken now (empty ring or rate budget exhausted).
+static int take(struct block *block,struct breq *q) {
     uint64_t avail=((uint64_t)block->pfn<<12)+16*QSZ;
-    uint64_t used=(avail+4+2*QSZ+2+4095)&~4095ULL;
     uint16_t upto=get(guest(avail+2,2),2);
     atomic_thread_fence(memory_order_acquire);
     if((uint16_t)(upto-block->last_avail)>QSZ) fail("available ring overrun");
-    uint16_t before=block->last_avail;uint64_t turn_bytes=0;
-    while(block->last_avail!=upto && (uint16_t)(block->last_avail-before)<32 && turn_bytes<(8ULL<<20)) {
-        uint16_t head=get(guest(avail+4+2*(block->last_avail%QSZ),2),2);
-        struct desc h=descriptor(block,head);
-        if(h.len!=16 || (h.flags&2) || !(h.flags&1)) fail("invalid block header");
-        uint8_t header[16];memcpy(header,guest(h.addr,16),sizeof(header));
-        uint32_t type=get(header,4);uint64_t sector=get(header+8,8);
-        struct desc chain[QSZ];unsigned count=0;uint16_t index=h.next;
-        uint64_t transferred=0;
-        // Snapshot and validate the entire chain before any disk side effect.
-        // Guest descriptor edits cannot redirect a descriptor after validation.
-        for(;;){
-            if(count>=QSZ-1)fail("descriptor cycle");
-            struct desc d=descriptor(block,index);chain[count++]=d;
-            if(!(d.flags&1)){
-                if(!(d.flags&2)||d.len!=1)fail("invalid block->status descriptor");
+    if(block->last_avail==upto)return 0;
+    uint16_t head=get(guest(avail+4+2*(block->last_avail%QSZ),2),2);
+    struct desc h=descriptor(block,head);
+    if(h.len!=16 || (h.flags&2) || !(h.flags&1)) fail("invalid block header");
+    uint8_t header[16];memcpy(header,guest(h.addr,16),sizeof(header));
+    uint32_t type=get(header,4);uint64_t sector=get(header+8,8);
+    struct desc chain[QSZ];unsigned count=0;uint16_t index=h.next;
+    uint64_t transferred=0;
+    // Snapshot and validate the entire chain before any disk side effect.
+    // Guest descriptor edits cannot redirect a descriptor after validation.
+    for(;;){
+        if(count>=QSZ-1)fail("descriptor cycle");
+        struct desc d=descriptor(block,index);chain[count++]=d;
+        if(!(d.flags&1)){
+            if(!(d.flags&2)||d.len!=1)fail("invalid block->status descriptor");
+            break;
+        }
+        transferred+=d.len;if(transferred>(4ULL<<20))fail("request exceeds 4 MiB");
+        if((type==0||type==1) && !!(d.flags&2)!=(type==0))fail("incorrect block DMA direction");
+        index=d.next;
+    }
+    if(!budget_take(&disk_budget,transferred,1))return 0;
+    q->head=head;q->type=type;q->transferred=transferred;q->iovcnt=0;q->written=1;q->offset=0;
+    q->result=(type==0||type==1||type==4)?0:2;
+    if(type==1 && block->read_only)q->result=1;
+    if(sector>block->disk_size/512)q->result=1;else q->offset=sector*512;
+    q->status_byte=guest(chain[count-1].addr,1);
+    if(type==0 || type==1){
+        // The descriptor chain and complete disk range are checked before
+        // the first host I/O. Empty segments need no iovec entry.
+        if(transferred>block->disk_size || q->offset>block->disk_size-transferred)q->result=1;
+        if(!q->result)for(unsigned j=0;j+1<count;j++)if(chain[j].len){
+            q->iov[q->iovcnt].iov_base=guest(chain[j].addr,chain[j].len);
+            q->iov[q->iovcnt++].iov_len=chain[j].len;
+        }
+    }else if(count>1)q->result=2;
+    block->last_avail++;
+    return 1;
+}
+// Host I/O for one request, without the device lock.
+static void perform(struct block *block,struct breq *q) {
+    if(q->type==0 || q->type==1){
+        size_t done=0;int next=0;
+        while(!q->result && next<q->iovcnt){
+            ssize_t n=q->type==0?preadv(block->diskfd,q->iov+next,q->iovcnt-next,q->offset+done):
+                                  pwritev(block->diskfd,q->iov+next,q->iovcnt-next,q->offset+done);
+            if(n<0 && errno==EINTR)continue;
+            if(n<=0){
+                q->result=1;
+                if(q->type==1)latch_storage_error(block,n<0?errno:EIO);
                 break;
             }
-            transferred+=d.len;if(transferred>(4ULL<<20))fail("request exceeds 4 MiB");
-            if((type==0||type==1) && !!(d.flags&2)!=(type==0))fail("incorrect block DMA direction");
-            index=d.next;
-        }
-        if(!budget_take(&disk_budget,transferred,1))break;
-        uint64_t offset=0;uint8_t result=(type==0||type==1||type==4)?0:2;uint32_t written=1;
-        if(type==1 && block->read_only)result=1;
-        if(sector>block->disk_size/512)result=1;else offset=sector*512;
-        uint8_t *status_byte=guest(chain[count-1].addr,1);
-        if(type==0 || type==1){
-            // The descriptor chain and complete disk range are checked before
-            // the first host I/O. Empty segments need no iovec entry.
-            if(transferred>block->disk_size || offset>block->disk_size-transferred)result=1;
-            struct iovec iov[QSZ-1];int iovcnt=0;
-            if(!result)for(unsigned j=0;j+1<count;j++)if(chain[j].len){
-                iov[iovcnt].iov_base=guest(chain[j].addr,chain[j].len);
-                iov[iovcnt++].iov_len=chain[j].len;
+            done+=(size_t)n;
+            size_t consumed=(size_t)n;
+            while(next<q->iovcnt && consumed>=q->iov[next].iov_len){
+                consumed-=q->iov[next].iov_len;next++;
             }
-            size_t done=0;int next=0;
-            while(!result && next<iovcnt){
-                ssize_t n=type==0?preadv(block->diskfd,iov+next,iovcnt-next,offset+done):
-                                   pwritev(block->diskfd,iov+next,iovcnt-next,offset+done);
-                if(n<0 && errno==EINTR)continue;
-                if(n<=0){
-                    result=1;
-                    if(type==1)latch_storage_error(block,n<0?errno:EIO);
-                    break;
-                }
-                done+=(size_t)n;
-                if(type==0)block->read_bytes+=(uint64_t)n;else block->write_bytes+=(uint64_t)n;
-                size_t consumed=(size_t)n;
-                while(next<iovcnt && consumed>=iov[next].iov_len){
-                    consumed-=iov[next].iov_len;next++;
-                }
-                if(consumed){
-                    iov[next].iov_base=(uint8_t *)iov[next].iov_base+consumed;
-                    iov[next].iov_len-=consumed;
-                }
+            if(consumed){
+                q->iov[next].iov_base=(uint8_t *)q->iov[next].iov_base+consumed;
+                q->iov[next].iov_len-=consumed;
             }
-            if(type==0)written+=done;
-        }else if(count>1)result=2;
-        // FLUSH has header and block->status only; perform it before publishing completion.
-        if(type==4 && !block->read_only){
-            if(block->storage_errno)result=1;
-            else if(flush_disk(block->diskfd)){result=1;latch_storage_error(block,errno);}
         }
-        if(result)block->errors++;
-        *status_byte=result;turn_bytes+=transferred;
-        put(guest(used+4+8*(block->used_idx%QSZ),8),4,head);
-        put(guest(used+8+8*(block->used_idx%QSZ),4),4,written);
-        atomic_thread_fence(memory_order_release);
-        put(guest(used+2,2),2,++block->used_idx);
-        block->last_avail++; block->requests++;
+        if(q->type==0){q->written+=done;}
+        q->transferred=done;
     }
-    if(block->last_avail!=before){block->isr|=1; irq(block,1);}
+    // FLUSH has header and block->status only; perform it before publishing completion.
+    // It runs alone (see the worker), so it covers every write completed before it.
+    if(q->type==4 && !block->read_only && !q->result){
+        if(__atomic_load_n(&block->storage_errno,__ATOMIC_SEQ_CST))q->result=1;
+        else if(flush_disk(block->diskfd)){q->result=1;latch_storage_error(block,errno);}
+    }
+}
+// Device lock held.
+static void publish(struct block *block,struct breq *q) {
+    uint64_t used=(((uint64_t)block->pfn<<12)+16*QSZ+4+2*QSZ+2+4095)&~4095ULL;
+    if(q->result)block->errors++;
+    if(q->type==0)block->read_bytes+=q->transferred;
+    else if(q->type==1)block->write_bytes+=q->transferred;
+    *q->status_byte=q->result;
+    put(guest(used+4+8*(block->used_idx%QSZ),8),4,q->head);
+    put(guest(used+8+8*(block->used_idx%QSZ),4),4,q->written);
+    atomic_thread_fence(memory_order_release);
+    put(guest(used+2,2),2,++block->used_idx);
+    block->requests++;
+    block->isr|=1;irq(block,1);
+}
+static int ring_ready(struct block *block) {
+    if(!block->pfn || !(block->status&4))return 0;
+    uint16_t upto=get(guest(((uint64_t)block->pfn<<12)+16*QSZ+2,2),2);
+    return upto!=block->last_avail;
+}
+// Device lock held: does q overlap a write (or q a write overlapping a read)
+// taken before it and still in flight?
+static int overlaps(struct block *block,struct breq *q,int self) {
+    if(q->type!=0 && q->type!=1)return 0;
+    uint64_t end=q->offset+q->transferred;
+    for(int i=0;i<WORKERS;i++){
+        struct breq *o=block->current[i];
+        if(i==self || !o || o->seq>q->seq || (o->type!=0 && o->type!=1))continue;
+        if(q->offset<o->offset+o->transferred && o->offset<end && (q->type==1 || o->type==1))return 1;
+    }
+    return 0;
+}
+static void *block_worker(void *arg) {
+    struct worker_arg *wa=arg;
+    struct block *block=wa->block;int self=wa->index;
+    struct breq *q=calloc(1,sizeof(*q));
+    if(!q)fail("worker memory");
+    pthread_mutex_lock(&io_lock);
+    for(;;){
+        // A FLUSH in progress, or one waiting for earlier requests, holds new work.
+        while(!block->stop && (block->flushing || !ring_ready(block)))pthread_cond_wait(&block->wake,&io_lock);
+        if(block->stop)break;
+        uint64_t generation=block->generation;
+        if(!take(block,q)){
+            // Rate budget exhausted: retry shortly (main loop polling also wakes us).
+            struct timespec t;clock_gettime(CLOCK_REALTIME,&t);t.tv_nsec+=1000000;
+            if(t.tv_nsec>=1000000000){t.tv_sec++;t.tv_nsec-=1000000000;}
+            pthread_cond_timedwait(&block->wake,&io_lock,&t);
+            continue;
+        }
+        block->inflight++;
+        q->seq=++block->taken;
+        block->current[self]=q;
+        if(q->type==4){
+            block->flushing=1;
+            while(block->inflight>1)pthread_cond_wait(&block->idle,&io_lock);
+        }
+        while(overlaps(block,q,self))pthread_cond_wait(&block->idle,&io_lock);
+        // More requests may be waiting: let another worker take the next one.
+        if(!block->flushing)pthread_cond_signal(&block->wake);
+        pthread_mutex_unlock(&io_lock);
+        perform(block,q);
+        pthread_mutex_lock(&io_lock);
+        block->current[self]=NULL;
+        block->inflight--;
+        if(q->type==4){block->flushing=0;pthread_cond_broadcast(&block->wake);}
+        if(generation==block->generation)publish(block,q);
+        pthread_cond_broadcast(&block->idle);
+    }
+    pthread_mutex_unlock(&io_lock);
+    free(q);
+    return NULL;
+}
+// Device lock held: wait until nothing is in flight.
+static void quiesce(struct block *block) {
+    while(block->inflight)pthread_cond_wait(&block->idle,&io_lock);
+    block->generation++;
+}
+static void notify(struct block *block) {
+    if(!(block->status&4) || !block->pfn) fail("queue used before ready");
+    pthread_cond_broadcast(&block->wake);
 }
 int devices_init(void *ram,size_t size,const char *disk,const struct hvf_options *options) {
     budget_init(&disk_budget,options->disk_bytes_per_second,options->disk_operations_per_second,4ULL<<20,32);
@@ -201,6 +308,13 @@ int devices_init(void *ram,size_t size,const char *disk,const struct hvf_options
 #endif
         put(block->config,2,0x1af4);put(block->config+2,2,0x1001);block->config[0xb]=1;
         put(block->config+0x10,4,block->bar);put(block->config+0x2c,2,0x1af4);put(block->config+0x2e,2,2);block->config[0x3d]=1;
+        pthread_cond_init(&block->wake,NULL);pthread_cond_init(&block->idle,NULL);
+        block->inflight=block->flushing=block->stop=0;block->generation=0;block->taken=0;
+        for(int w=0;w<WORKERS;w++){
+            block->current[w]=NULL;block->wargs[w].block=block;block->wargs[w].index=w;
+            if(pthread_create(&block->worker[w],NULL,block_worker,&block->wargs[w]))return -1;
+            block->workers_started++;
+        }
     }
     return 0;
 }
@@ -222,10 +336,10 @@ static int block_mmio(struct block *block,uint64_t addr,unsigned size,int write,
     if(write) {
         switch(off) {
         case 4: if(size!=4) return 0; block->guest_features=*v; if(block->guest_features & ~((1U<<2)|(1U<<9)|(block->read_only?(1U<<5):0))) return 0; break;
-        case 8: if(size!=4 || block->qsel) return 0; block->pfn=*v; block->last_avail=block->used_idx=0; break;
+        case 8: if(size!=4 || block->qsel) return 0; quiesce(block); block->pfn=*v; block->last_avail=block->used_idx=0; break;
         case 14: if(size!=2) return 0; block->qsel=*v; break;
         case 16: if(size!=2 || *v) return 0; notify(block); break;
-        case 18: if(size!=1) return 0; block->status=*v; if(!block->status) { block->pfn=0;block->last_avail=block->used_idx=0;block->guest_features=0;block->isr=0;irq(block,0); } break;
+        case 18: if(size!=1) return 0; if(!*v) quiesce(block); block->status=*v; if(!block->status) { block->pfn=0;block->last_avail=block->used_idx=0;block->guest_features=0;block->isr=0;irq(block,0); } break;
         default: return 0;
         }
     } else {
@@ -285,10 +399,19 @@ uint64_t devices_queue_depth(void){
     }
     return total;
 }
-int devices_pending(void){return devices_queue_depth()!=0;}
+int devices_pending(void){
+    for(unsigned i=0;i<block_count;i++)if(blocks[i].inflight)return 1;
+    return devices_queue_depth()!=0;
+}
 void devices_poll(void){for(unsigned i=0;i<block_count;i++)if(blocks[i].pfn && (blocks[i].status&4))notify(&blocks[i]);}
 int devices_exit_status(void){return guest_exit;}
 void devices_close(void) {
+    // Called without the device lock: stop and join the workers first.
+    for(unsigned i=0;i<block_count;i++)if(blocks[i].workers_started){
+        pthread_mutex_lock(&io_lock);blocks[i].stop=1;pthread_cond_broadcast(&blocks[i].wake);pthread_mutex_unlock(&io_lock);
+        for(int w=0;w<blocks[i].workers_started;w++)pthread_join(blocks[i].worker[w],NULL);
+        blocks[i].workers_started=0;
+    }
     for(unsigned i=0;i<block_count;i++)if(blocks[i].diskfd>=0){
         struct block *b=&blocks[i];
         // A guest may exit without a final FLUSH; do not leave its last writes

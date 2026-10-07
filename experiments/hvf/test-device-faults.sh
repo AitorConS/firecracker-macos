@@ -6,13 +6,13 @@ build=experiments/hvf/build
 mkdir -p "$build/device-fault-mutants"
 compile() { # output [extra flags]
     out=$1; shift
-    "$clang" -g -O1 -Wall -Wextra -Werror -fsanitize=address,undefined "$@" \
+    "$clang" -g -O1 -Wall -Wextra -Werror -fsanitize=address,undefined -pthread "$@" \
         -Iexperiments/hvf/fuzz/stubs -Isrc/hvf-vmm/native experiments/hvf/device-fault-test.c -o "$out"
 }
 run_case() { ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 "$@"; }
 cases="advertised-segments short-read short-write vector-read vector-write vector-short-read vector-short-write
 vector-range write-eintr descriptor-edit io-error no-space eof flush-error
-flush-unsupported flush-eintr flush-success flush-sticky ordering flush-readonly
+flush-unsupported flush-eintr flush-success flush-sticky ordering overlap flush-readonly
 snapshot-latched close-flush close-latched"
 compile "$build/device-fault-test"
 for test in $cases; do
@@ -34,9 +34,11 @@ mutant() { # name case sed-expression
     fi
     echo "PASS mutant $name detected by $case"
 }
-mutant no-latch-flush flush-sticky 's/if(block->storage_errno)result=1;/if(0)result=1;/'
-mutant no-latch-write io-error 's/if(block->storage_errno)result=1;/if(0)result=1;/'
+mutant no-latch-flush flush-sticky 's/if(__atomic_load_n(\&block->storage_errno,__ATOMIC_SEQ_CST))q->result=1;/if(0)q->result=1;/'
+mutant no-latch-write io-error 's/if(__atomic_load_n(\&block->storage_errno,__ATOMIC_SEQ_CST))q->result=1;/if(0)q->result=1;/'
 mutant fsync-fallback flush-unsupported 's/} while (result == -1 \&\& errno == EINTR);/} while (result == -1 \&\& errno == EINTR); if(result==-1)result=fsync(fd);/'
-mutant flush-ignored flush-error 's/else if(flush_disk(block->diskfd)){result=1;latch_storage_error(block,errno);}/else {}/'
-mutant publish-before-flush ordering 's/        if(type==4 \&\& !block->read_only){/        if(type==4){*status_byte=0;put(guest(used+2,2),2,(uint16_t)(block->used_idx+1));} if(type==4 \&\& !block->read_only){/'
+mutant flush-ignored flush-error 's/else if(flush_disk(block->diskfd)){q->result=1;latch_storage_error(block,errno);}/else {}/'
+mutant publish-before-flush ordering 's/^        perform(block,q);$/        if(q->type==4){pthread_mutex_lock(\&io_lock);*q->status_byte=0;pthread_mutex_unlock(\&io_lock);} perform(block,q);/'
+mutant no-flush-barrier ordering 's/while(block->inflight>1)pthread_cond_wait/while(0)pthread_cond_wait/'
+mutant no-overlap-order overlap 's/while(overlaps(block,q,self))pthread_cond_wait/while(0 \&\& overlaps(block,q,self))pthread_cond_wait/'
 mutant no-close-flush close-flush 's/else if(flush_disk(b->diskfd))fprintf/else if(0)fprintf/'

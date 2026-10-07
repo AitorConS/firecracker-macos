@@ -85,7 +85,7 @@ struct cpu {
 static struct cpu cpus[MAX_CPUS];
 static unsigned ncpus=1;
 static const struct hvf_options *options;
-static pthread_mutex_t io_lock=PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t io_lock=PTHREAD_MUTEX_INITIALIZER;  /* device I/O lock, shared with devices.c */
 static pthread_mutex_t state_lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t state_change=PTHREAD_COND_INITIALIZER;
 static atomic_int result=-1;

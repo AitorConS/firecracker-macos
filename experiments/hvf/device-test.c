@@ -8,6 +8,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <pthread.h>
+pthread_mutex_t io_lock=PTHREAD_MUTEX_INITIALIZER;  /* device I/O lock (probe.c in the VMM) */
 #define BASE 0x40000000ULL
 #define BAR 0x10000000ULL
 #define SIZE (1<<20)
@@ -15,7 +17,11 @@ struct descriptor { uint64_t addr; uint32_t len; uint16_t flags,next; };
 static int witness=-1;
 static uint8_t original[512];
 static void unchanged(void){if(witness>=0){uint8_t data[512];assert(pread(witness,data,512,0)==512);assert(!memcmp(data,original,512));}}
-static void wr(uint64_t off,unsigned size,uint64_t v){assert(devices_mmio(BAR+off,size,1,&v));}
+// Device accesses hold the device I/O lock, as vCPU exits do in the VMM.
+static int mmio(uint64_t addr,unsigned size,int write,uint64_t *v){
+    pthread_mutex_lock(&io_lock);int r=devices_mmio(addr,size,write,v);pthread_mutex_unlock(&io_lock);return r;
+}
+static void wr(uint64_t off,unsigned size,uint64_t v){assert(mmio(BAR+off,size,1,&v));}
 int main(int argc,char **argv){
     assert(argc==2);const char *test=argv[1];
     uint8_t *ram=calloc(1,SIZE);assert(ram);
@@ -45,17 +51,22 @@ int main(int argc,char **argv){
     if(!strcmp(test,"unknown")){header[0]=42;desc[0].next=2;}
     uint16_t *avail=(void*)(ram+0x11000);avail[1]=1;avail[2]=0;
     wr(18,1,7);wr(8,4,(BASE+0x10000)>>12);wr(16,2,0);
+    // Block requests complete on worker threads: wait for the used ring.
+    for(int i=0;i<5000;i++){
+        pthread_mutex_lock(&io_lock);uint16_t used=*(volatile uint16_t*)(ram+0x12002);pthread_mutex_unlock(&io_lock);
+        if(used==1)break;usleep(1000);
+    }
     if(!strcmp(test,"firmware")){
-        uint64_t v=0x2000;assert(devices_mmio(0x09020008,2,1,&v));
-        for(unsigned i=0;i<4;i++){v=99;assert(devices_mmio(0x09020000,1,0,&v));assert(v==payload[i]);}
-        v=99;assert(devices_mmio(0x09020000,1,0,&v)&&v==0);
+        uint64_t v=0x2000;assert(mmio(0x09020008,2,1,&v));
+        for(unsigned i=0;i<4;i++){v=99;assert(mmio(0x09020000,1,0,&v));assert(v==payload[i]);}
+        v=99;assert(mmio(0x09020000,1,0,&v)&&v==0);
     }
     uint8_t status=ram[0x40000];assert(status==(!strcmp(test,"readonly")?1:!strcmp(test,"unknown")?2:0));
     assert(*(uint16_t*)(ram+0x12002)==1);
-    uint64_t value=0;assert(devices_mmio(BAR+19,1,0,&value)&&value==1);assert(devices_mmio(BAR+19,1,0,&value)&&value==0);
+    uint64_t value=0;assert(mmio(BAR+19,1,0,&value)&&value==1);assert(mmio(BAR+19,1,0,&value)&&value==0);
     if(!strcmp(test,"read"))assert(!memcmp(ram+0x30000,pattern,512));
     if(!strcmp(test,"write")){assert(pread(fd,pattern,512,0)==512);for(unsigned i=0;i<512;i++)assert(pattern[i]==0xa5);}
     if(!strcmp(test,"readonly")){uint8_t data[512];assert(pread(fd,data,512,0)==512);assert(!memcmp(data,pattern,512));}
-    wr(18,1,0);value=9;assert(devices_mmio(BAR+8,4,0,&value)&&value==0);
+    wr(18,1,0);value=9;assert(mmio(BAR+8,4,0,&value)&&value==0);
     devices_close();assert(hv_vcpu_destroy(cpu)==HV_SUCCESS);assert(hv_vm_destroy()==HV_SUCCESS);close(fd);free(ram);return 0;
 }

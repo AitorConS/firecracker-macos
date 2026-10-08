@@ -85,7 +85,7 @@ struct cpu {
 static struct cpu cpus[MAX_CPUS];
 static unsigned ncpus=1;
 static const struct hvf_options *options;
-static pthread_mutex_t io_lock=PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t io_lock=PTHREAD_MUTEX_INITIALIZER;  /* device I/O lock, shared with devices.c */
 static pthread_mutex_t state_lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t state_change=PTHREAD_COND_INITIALIZER;
 static atomic_int result=-1;
@@ -481,6 +481,8 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
         usleep(phase==0 && network_hot_polls?100:1000);
     }
     pthread_mutex_lock(&state_lock);pthread_cond_broadcast(&state_change);pthread_mutex_unlock(&state_lock);
+    // Block workers raise interrupts: stop them while vCPUs and the GIC exist.
+    devices_stop();
     // A canceled exit wakes sleeping/running CPUs so all can join teardown.
     hv_vcpu_t ids[MAX_CPUS];for(unsigned i=0;i<ncpus;i++)ids[i]=cpus[i].id;
     CHECK(hv_vcpus_exit(ids,ncpus));

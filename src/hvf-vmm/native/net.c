@@ -4,6 +4,7 @@
 static struct budget network_budget;
 #include <Hypervisor/Hypervisor.h>
 #include "net_backend.h"
+#include "net_peer.h"
 #include <poll.h>
 #include <errno.h>
 #include <sys/mman.h>
@@ -92,7 +93,10 @@ static void transmit(void){
         if(!budget_take(&network_budget,len-10,1))break;
         // A full broker socket is backpressure, not packet loss. Leave this
         // descriptor available and retry it on the next supervisor poll.
-        if(!net_backend_send(frame+10,len-10))break;
+        // Direct peers first; everything else (and anything they refuse) uses the switch.
+        int sent=net_peer_send(frame+10,len-10);
+        if(sent<0)sent=net_backend_send(frame+10,len-10);
+        if(!sent)break;
         complete(q,h,0);tx++;tx_bytes+=len-10;
     }
 }
@@ -139,10 +143,10 @@ int net_pending_tx(void){return enabled && pending(&queues[1]);}
 int net_poll(void){
     if(!enabled)return 0;
     unsigned long before_tx=tx,before_rx=rx;
-    transmit();net_backend_poll();
+    transmit();net_backend_poll();net_peer_poll();
     return tx!=before_tx||rx!=before_rx;
 }
-void net_close(void){if(enabled){fprintf(stderr,"network: TX=%lu RX=%lu\n",tx,rx);net_backend_close();enabled=0;}}
+void net_close(void){if(enabled){fprintf(stderr,"network: TX=%lu RX=%lu\n",tx,rx);net_peer_close();net_backend_close();enabled=0;}}
 
 // Caller holds the device I/O lock. RX drops count empty rings; rate limiting defers one bounded IPC frame.
 void net_metrics(uint64_t out[6]) {

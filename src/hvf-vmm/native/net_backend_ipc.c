@@ -18,8 +18,10 @@
 #include <string.h>
 
 #include "net_backend_stream.h"
+#include "net_peer.h"
+#include "net_peer_relay.h"
 
-static int frames=-1,health=-1,stats=-1;
+static int frames=-1,health=-1,stats=-1,peer_channel=-1;
 static uint64_t stream_drops,stream_drop_bytes;
 static uint64_t tx_drops,tx_drop_bytes,rx_drops,rx_drop_bytes,stats_drops;
 static uint8_t deferred_frame[65536];
@@ -50,7 +52,7 @@ static void broker_main(const struct hvf_options *options){
     int lease=lease_env?atoi(lease_env):-1;
     long maximum=sysconf(_SC_OPEN_MAX);
     if(maximum<0||maximum>1048576)maximum=1048576;
-    for(int fd=0;fd<maximum;fd++)if(fd!=frames&&fd!=health&&fd!=stats&&fd!=STDERR_FILENO&&fd!=lease)close(fd);
+    for(int fd=0;fd<maximum;fd++)if(fd!=frames&&fd!=health&&fd!=stats&&fd!=peer_channel&&fd!=STDERR_FILENO&&fd!=lease)close(fd);
     // Keep stdout occupied: GLib diagnostics must never write into a reused socket FD.
     if(dup2(STDERR_FILENO,STDOUT_FILENO)<0)_exit(2);
     hvf_policy_set(options->security);
@@ -63,6 +65,7 @@ static void broker_main(const struct hvf_options *options){
     if(is_stream?stream_open(options,broker_deliver):slirp_backend_open(options,broker_deliver)){
         (void)control_send(health,'E',0);_exit(2);
     }
+    if(is_stream&&options->control_path&&peer_channel>=0)relay_open(options->control_path,peer_channel,options->mac);
     if(control_send(health,'B',0))_exit(2);
     uint8_t packet[65537];
     struct control_reader commands={0};
@@ -83,8 +86,10 @@ static void broker_main(const struct hvf_options *options){
             if(stream.used<stream.need)stream_events|=POLLIN;
             if(stream.queued)stream_events|=POLLOUT;
         }
-        struct pollfd fds[3]={{health,POLLIN,0},{frames,POLLIN,0},{stream.fd,stream_events,0}};
-        int result=poll(fds,is_stream && stream.fd>=0?3:2,1);
+        struct pollfd fds[5]={{health,POLLIN,0},{frames,POLLIN,0},{stream.fd,stream_events,0}};
+        unsigned nfds=is_stream && stream.fd>=0?3:2;
+        nfds+=relay_poll_fds(fds+nfds);
+        int result=poll(fds,nfds,1);
         if(result<0&&errno!=EINTR)break;
         if(fds[0].revents){
             uint8_t kind;uint64_t operation;
@@ -105,6 +110,8 @@ static void broker_main(const struct hvf_options *options){
                 if(control_send(health,'A',operation))break;
             }
         }
+        // Peer control carries no guest memory or frames; it continues while paused.
+        relay_service();
         if(paused){usleep(1000);continue;}
         for(unsigned budget=0;budget<256;budget++){
             if(is_stream){stream_flush();if(stream.queued)break;}
@@ -119,7 +126,7 @@ done:
     if(is_stream)stream_disconnect();else slirp_backend_close();close(frames);close(health);_exit(0);
 }
 int net_backend_open(const struct hvf_options *options,net_receive_fn receive){
-    int data[2],control[2],telemetry[2];
+    int data[2],control[2],telemetry[2],peers[2]={-1,-1};
     if(socketpair(AF_UNIX,SOCK_DGRAM,0,data))return -1;
     if(socketpair(AF_UNIX,SOCK_STREAM,0,control)){close(data[0]);close(data[1]);return -1;}
     if(socketpair(AF_UNIX,SOCK_DGRAM,0,telemetry)){close(data[0]);close(data[1]);close(control[0]);close(control[1]);return -1;}
@@ -129,10 +136,18 @@ int net_backend_open(const struct hvf_options *options,net_receive_fn receive){
             close(data[0]);close(data[1]);close(control[0]);close(control[1]);close(telemetry[0]);close(telemetry[1]);return -1;
         }
     }
+    if(options->stream_path&&options->control_path&&socketpair(AF_UNIX,SOCK_DGRAM,0,peers)){
+        close(data[0]);close(data[1]);close(control[0]);close(control[1]);close(telemetry[0]);close(telemetry[1]);return -1;
+    }
     broker=fork();
-    if(broker<0){close(data[0]);close(data[1]);close(control[0]);close(control[1]);close(telemetry[0]);close(telemetry[1]);return -1;}
-    if(!broker){close(data[0]);close(control[0]);close(telemetry[0]);frames=data[1];health=control[1];stats=telemetry[1];broker_main(options);}
-    close(data[1]);close(control[1]);close(telemetry[1]);frames=data[0];health=control[0];stats=telemetry[0];receive_frame=receive;
+    if(broker<0){close(data[0]);close(data[1]);close(control[0]);close(control[1]);close(telemetry[0]);close(telemetry[1]);if(peers[0]>=0){close(peers[0]);close(peers[1]);}return -1;}
+    if(!broker){close(data[0]);close(control[0]);close(telemetry[0]);if(peers[0]>=0)close(peers[0]);frames=data[1];health=control[1];stats=telemetry[1];peer_channel=peers[1];broker_main(options);}
+    close(data[1]);close(control[1]);close(telemetry[1]);if(peers[1]>=0)close(peers[1]);frames=data[0];health=control[0];stats=telemetry[0];receive_frame=receive;
+    if(peers[0]>=0){
+        int flags=fcntl(peers[0],F_GETFL);
+        if(flags<0||fcntl(peers[0],F_SETFL,flags|O_NONBLOCK)||fcntl(peers[0],F_SETFD,FD_CLOEXEC)){close(peers[0]);peers[0]=-1;}
+    }
+    net_peer_open(peers[0],options->mac,receive);
     struct pollfd ready={health,POLLIN,0};
     struct control_reader reader={0};uint8_t kind=0;uint64_t operation=0;
     // Startup runs on the supervisor's asynchronous worker; runtime never blocks.

@@ -45,6 +45,10 @@ pub(crate) struct Security {
     pub dns: Option<Resolver>,
     #[serde(default)]
     pub unix_stream: Option<std::path::PathBuf>,
+    /// Peer control socket of the external switch (direct VM-to-VM links).
+    /// Requires unix_stream and lives in the same private directory.
+    #[serde(default)]
+    pub unix_control: Option<std::path::PathBuf>,
 }
 impl Default for Security {
     fn default() -> Self {
@@ -55,6 +59,7 @@ impl Default for Security {
             listeners: Vec::new(),
             dns: None,
             unix_stream: None,
+            unix_control: None,
         }
     }
 }
@@ -162,10 +167,26 @@ impl Policy {
             }
             let resolved =
                 std::fs::canonicalize(parent)?.join(path.file_name().ok_or("missing socket name")?);
-            let literal = serde_json::to_string(resolved.to_str().ok_or("invalid socket path")?)?;
-            format!(
-                "(version 1)(deny default)(allow file-read-metadata (literal {literal}))(allow network-outbound (remote unix-socket (path {literal})))"
-            )
+            let mut literals = vec![serde_json::to_string(
+                resolved.to_str().ok_or("invalid socket path")?,
+            )?];
+            if let Some(control) = &config.unix_control {
+                if control.parent() != Some(parent) {
+                    return Err("unix_control must share the unix_stream directory".into());
+                }
+                let resolved = std::fs::canonicalize(parent)?
+                    .join(control.file_name().ok_or("missing control socket name")?);
+                literals.push(serde_json::to_string(
+                    resolved.to_str().ok_or("invalid control socket path")?,
+                )?);
+            }
+            let mut profile = String::from("(version 1)(deny default)");
+            for literal in &literals {
+                profile.push_str(&format!(
+                    "(allow file-read-metadata (literal {literal}))(allow network-outbound (remote unix-socket (path {literal})))"
+                ));
+            }
+            profile
         } else {
             "(version 1)(deny default)".to_string()
         };

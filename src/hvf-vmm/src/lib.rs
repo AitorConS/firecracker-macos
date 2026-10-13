@@ -219,8 +219,25 @@ impl Config {
                 {
                     return Err("unix-stream requires matching security.unix_stream; IP policy and forwards belong to the external switch".into());
                 }
-            } else if net.socket_path.is_some() || security.unix_stream.is_some() {
-                return Err("socket_path/security.unix_stream require unix-stream backend".into());
+                if let Some(control) = &security.unix_control {
+                    let value = control.to_str().ok_or("unix_control must be UTF-8")?;
+                    if !control.is_absolute()
+                        || value.len() >= 104
+                        || value.chars().any(char::is_control)
+                        || control
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir))
+                        || control == path
+                        || control.parent() != path.parent()
+                    {
+                        return Err("invalid peer control socket path".into());
+                    }
+                }
+            } else if net.socket_path.is_some()
+                || security.unix_stream.is_some()
+                || security.unix_control.is_some()
+            {
+                return Err("socket_path/security.unix_stream/unix_control require unix-stream backend".into());
             }
             mac_bytes(&net.guest_mac)?;
             let mut bindings = std::collections::BTreeSet::new();
@@ -316,6 +333,7 @@ struct NativeOptions {
     security: *const security::NativeSecurity,
     snapshot_dir: *const std::ffi::c_char,
     stream_path: *const std::ffi::c_char,
+    control_path: *const std::ffi::c_char,
     restore: u32,
     cpu_seconds: u64,
     disk_bytes_per_second: u64,
@@ -450,6 +468,17 @@ fn run(config: Config) -> Result<i32> {
             Ok(CString::new(path.as_os_str().as_bytes())?)
         })
         .transpose()?;
+    let control_path = config
+        .security
+        .as_ref()
+        .and_then(|s| s.unix_control.as_ref())
+        .filter(|_| stream_path.is_some())
+        .map(|p| -> Result<CString> {
+            let path = fs::canonicalize(p.parent().ok_or("missing control socket parent")?)?
+                .join(p.file_name().ok_or("missing control socket name")?);
+            Ok(CString::new(path.as_os_str().as_bytes())?)
+        })
+        .transpose()?;
     let forwards: Vec<_> = net
         .into_iter()
         .flat_map(|n| &n.forwards)
@@ -498,6 +527,9 @@ fn run(config: Config) -> Result<i32> {
         security: &policy.native,
         snapshot_dir: snapshot_dir.as_ptr(),
         stream_path: stream_path
+            .as_ref()
+            .map_or(std::ptr::null(), |p| p.as_ptr()),
+        control_path: control_path
             .as_ref()
             .map_or(std::ptr::null(), |p| p.as_ptr()),
         restore: (std::env::var("HVF_RESTORE").as_deref() == Ok("1")).into(),
@@ -658,6 +690,23 @@ mod stream_config_tests {
         }
         let mut c = config();
         c.network_interfaces[0].backend = "slirp".into();
+        assert!(c.validate_shape().is_err());
+    }
+    #[test]
+    fn control_socket_shares_the_stream_directory() {
+        let mut c = config();
+        c.security.as_mut().unwrap().unix_control = Some("/private/tmp/link.ctl".into());
+        c.validate_shape().unwrap();
+        for path in ["/private/tmp/link", "/private/other/link.ctl", "relative.ctl", "/private/tmp/../tmp/x.ctl"] {
+            let mut c = config();
+            c.security.as_mut().unwrap().unix_control = Some(path.into());
+            assert!(c.validate_shape().is_err(), "{path}");
+        }
+        let mut c = config();
+        c.network_interfaces[0].backend = "slirp".into();
+        c.network_interfaces[0].socket_path = None;
+        c.security.as_mut().unwrap().unix_stream = None;
+        c.security.as_mut().unwrap().unix_control = Some("/private/tmp/link.ctl".into());
         assert!(c.validate_shape().is_err());
     }
 }

@@ -57,7 +57,7 @@ static int relay_to_switch(const struct peer_message *m){
 static void relay_connected(void){
     uid_t uid;gid_t gid;
     if(getpeereid(relay.ctl,&uid,&gid)||uid!=geteuid()){relay_disconnect();return;}
-    struct peer_message hello={.type=PEER_HELLO,.value=PEER_FEATURE_DGRAM};memcpy(hello.mac,relay.mac,6);
+    struct peer_message hello={.type=PEER_HELLO,.value=PEER_FEATURE_DGRAM|PEER_FEATURE_VNET};memcpy(hello.mac,relay.mac,6);
     (void)relay_to_switch(&hello);
 }
 static void relay_connect(void){

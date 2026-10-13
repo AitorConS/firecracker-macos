@@ -6,6 +6,6 @@ mkdir -p experiments/hvf/build
 output=$(mktemp -d "$root/experiments/hvf/build/net-irq.XXXXXX")
 xcrun clang -arch arm64 -mmacosx-version-min=15.0 -Wall -Wextra -Werror \
   -fsanitize=address,undefined -g -I src/hvf-vmm/native \
-  experiments/hvf/test-net-irq.c src/hvf-vmm/native/net.c src/hvf-vmm/native/net_peer.c -o "$output/test-net-irq"
+  experiments/hvf/test-net-irq.c src/hvf-vmm/native/net.c src/hvf-vmm/native/net_peer.c src/hvf-vmm/native/net_gso.c -o "$output/test-net-irq"
 "$output/test-net-irq"
 echo "Virtio-net interrupt test binary: $output/test-net-irq"

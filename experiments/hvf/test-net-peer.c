@@ -20,13 +20,18 @@ static size_t delivered_size;
 static unsigned deliveries;
 static int ring_full;
 
+static int delivered_header;
 static ssize_t deliver(const void *frame,size_t size,void *opaque){
-    (void)opaque;
+    delivered_header=opaque!=NULL;
     if(ring_full)return -1;
     memcpy(delivered,frame,size);delivered_size=size;deliveries++;return (ssize_t)size;
 }
 static size_t ipv4(uint8_t *f,const uint8_t dst[6],const uint8_t src[6],const uint8_t ip[4],size_t size){
     memset(f,0,size);memcpy(f,dst,6);memcpy(f+6,src,6);f[12]=8;f[13]=0;f[14]=0x45;memcpy(f+26,ip,4);return size;
+}
+// A peer datagram: zero virtio_net_hdr, then the frame. Returns both lengths.
+static size_t vipv4(uint8_t *v,const uint8_t dst[6],const uint8_t src[6],const uint8_t ip[4],size_t size){
+    memset(v,0,10);return 10+ipv4(v+10,dst,src,ip,size);
 }
 static size_t arp(uint8_t *f,const uint8_t dst[6],const uint8_t src[6],const uint8_t ip[4]){
     memset(f,0,42);memcpy(f,dst,6);memcpy(f+6,src,6);f[12]=8;f[13]=6;
@@ -97,9 +102,9 @@ static void test_data_plane(void){
     int channel[2],link[2];
     assert(!socketpair(AF_UNIX,SOCK_DGRAM,0,channel));set_timeout(channel[1]);
     net_peer_open(channel[0],self_mac,deliver);
-    uint8_t f[9000];struct peer_message m;
+    uint8_t f[9010];struct peer_message m;
     // No peers yet: everything uses the switch.
-    assert(net_peer_send(f,ipv4(f,peer_mac,self_mac,self_ip,100))==-1);
+    assert(net_peer_send(f,vipv4(f,peer_mac,self_mac,self_ip,100))==-1);
 
     struct peer_message welcome={.type=PEER_WELCOME,.epoch=7};memcpy(welcome.mac,self_mac,6);memcpy(welcome.ip,self_ip,4);
     send_message(channel[1],&welcome,-1);
@@ -125,29 +130,29 @@ static void test_data_plane(void){
     uint64_t metrics[7];net_peer_metrics(metrics);assert(metrics[6]==1);
 
     // TX: unicast to the peer goes direct; broadcast, unknown and spoofed frames do not.
-    size_t size=ipv4(f,peer_mac,self_mac,self_ip,9000);
+    size_t size=vipv4(f,peer_mac,self_mac,self_ip,9000);
     assert(net_peer_send(f,size)==1);
     uint8_t got[65536];assert(recv(link[1],got,sizeof(got),0)==(ssize_t)size&&!memcmp(got,f,size));
     static const uint8_t broadcast[6]={255,255,255,255,255,255},other[6]={2,0,0,0,0,9};
-    assert(net_peer_send(f,ipv4(f,broadcast,self_mac,self_ip,60))==-1);
-    assert(net_peer_send(f,ipv4(f,other,self_mac,self_ip,60))==-1);
-    assert(net_peer_send(f,ipv4(f,peer_mac,self_mac,peer_ip,60))==-1);
+    assert(net_peer_send(f,vipv4(f,broadcast,self_mac,self_ip,60))==-1);
+    assert(net_peer_send(f,vipv4(f,other,self_mac,self_ip,60))==-1);
+    assert(net_peer_send(f,vipv4(f,peer_mac,self_mac,peer_ip,60))==-1);
 
     // RX: valid frames reach the guest; frames that break the peer's source contract do not.
-    size=ipv4(f,self_mac,peer_mac,peer_ip,1500);
+    size=vipv4(f,self_mac,peer_mac,peer_ip,1500);
     assert(send(link[1],f,size,0)==(ssize_t)size);
-    assert(net_peer_poll()==1&&deliveries==1&&delivered_size==size);
-    ipv4(f,self_mac,peer_mac,self_ip,100);assert(send(link[1],f,100,0)==100);
+    assert(net_peer_poll()==1&&deliveries==1&&delivered_size==size-10&&delivered_header);
+    vipv4(f,self_mac,peer_mac,self_ip,100);assert(send(link[1],f,110,0)==110);
     assert(net_peer_poll()==0&&deliveries==1);
     net_peer_metrics(metrics);assert(metrics[4]==1);
 
     // A full guest ring retains the frame for that peer and delivers it later.
-    ring_full=1;assert(send(link[1],f,ipv4(f,self_mac,peer_mac,peer_ip,200),0)==200);
+    ring_full=1;assert(send(link[1],f,vipv4(f,self_mac,peer_mac,peer_ip,200),0)==210);
     assert(net_peer_poll()==0&&deliveries==1);
     ring_full=0;assert(net_peer_poll()==1&&deliveries==2&&delivered_size==200);
 
     // A peer that stops reading first applies backpressure, then is dropped after the stall bound.
-    size=ipv4(f,peer_mac,self_mac,self_ip,9000);
+    size=vipv4(f,peer_mac,self_mac,self_ip,9000);
     int result;unsigned sent=0;
     while((result=net_peer_send(f,size))==1)sent++;
     assert(result==0&&sent>0);
@@ -210,7 +215,7 @@ static void test_relay(void){
     for(int i=0;i<100&&relay.connecting;i++){relay_service();usleep(1000);}
     int sw=accept(listener,NULL,NULL);assert(sw>=0);set_timeout(sw);
     struct peer_message m;
-    assert(read_message(sw,&m)<0&&m.type==PEER_HELLO&&m.value==PEER_FEATURE_DGRAM&&!memcmp(m.mac,self_mac,6));
+    assert(read_message(sw,&m)<0&&m.type==PEER_HELLO&&m.value==(PEER_FEATURE_DGRAM|PEER_FEATURE_VNET)&&!memcmp(m.mac,self_mac,6));
 
     struct peer_message welcome={.type=PEER_WELCOME,.epoch=3};memcpy(welcome.mac,self_mac,6);
     send_message(sw,&welcome,-1);
@@ -264,7 +269,7 @@ static void test_idle(void){
     send_message(channel[1],&welcome,-1);send_message(channel[1],&add,link[0]);close(link[0]);
     net_peer_poll();
     struct peer_message m;assert(read_message(channel[1],&m)<0&&m.type==PEER_ACK&&m.flags==1);
-    uint8_t f[100];size_t size=ipv4(f,peer_mac,self_mac,self_ip,100);
+    uint8_t f[110];size_t size=vipv4(f,peer_mac,self_mac,self_ip,100);
     usleep(250000);assert(net_peer_send(f,size)==1); // activity before the threshold
     usleep(250000);net_peer_poll();
     char byte;assert(recv(channel[1],&byte,1,MSG_DONTWAIT|MSG_PEEK)<0); // not idle yet
@@ -295,7 +300,7 @@ static void test_sandboxed_vmm(void){
         uint64_t metrics[7]={0};
         for(int i=0;i<2000&&metrics[6]==0;i++){net_peer_poll();net_peer_metrics(metrics);usleep(1000);}
         if(metrics[6]!=1)_exit(11);
-        uint8_t f[1500];size_t size=ipv4(f,peer_mac,self_mac,self_ip,1500);
+        uint8_t f[1510];size_t size=vipv4(f,peer_mac,self_mac,self_ip,1500);
         if(net_peer_send(f,size)!=1)_exit(12);
         for(int i=0;i<2000&&!deliveries;i++){net_peer_poll();usleep(1000);}
         _exit(deliveries==1&&delivered_size==200?0:13);
@@ -306,8 +311,8 @@ static void test_sandboxed_vmm(void){
     send_message(channel[1],&welcome,-1);send_message(channel[1],&add,link[0]);
     struct peer_message m;assert(read_message(channel[1],&m)<0&&m.type==PEER_ACK&&m.flags==1);
     close(link[0]);
-    uint8_t got[2000];assert(recv(link[1],got,sizeof(got),0)==1500);
-    uint8_t f[200];assert(send(link[1],f,ipv4(f,self_mac,peer_mac,peer_ip,200),0)==200);
+    uint8_t got[2000];assert(recv(link[1],got,sizeof(got),0)==1510);
+    uint8_t f[210];assert(send(link[1],f,vipv4(f,self_mac,peer_mac,peer_ip,200),0)==210);
     int status;assert(waitpid(child,&status,0)==child);
     if(!WIFEXITED(status)||WEXITSTATUS(status)){fprintf(stderr,"sandboxed VMM child status %d\n",status);abort();}
     close(channel[1]);close(link[1]);

@@ -10,7 +10,8 @@
 #include <time.h>
 #include <unistd.h>
 #define PEER_MAX 64
-#define PEER_FRAME 65536
+#define PEER_HDR 10
+#define PEER_FRAME (65536+PEER_HDR)
 #define PEER_RX_BUDGET 64
 // A peer that cannot take frames for this long is a stalled link: drop its
 // frames, as the switch's bounded writer does, so it never blocks the TX ring.
@@ -131,14 +132,16 @@ void net_peer_open(int fd,const uint8_t mac[6],net_peer_receive_fn receive){
     channel=fd;deliver=receive;memcpy(self_mac,mac,6);
     tx_frames=rx_frames=tx_bytes=rx_bytes=invalid_drops=stalled_drops=sent_tx=sent_rx=0;
 }
-int net_peer_send(const uint8_t *f,size_t len){
-    if(!npeers||len<14||(f[0]&1))return -1;
+int net_peer_send(const uint8_t *vnet_frame,size_t total){
+    if(!npeers||total<PEER_HDR+14)return -1;
+    const uint8_t *f=vnet_frame+PEER_HDR;size_t len=total-PEER_HDR;
+    if(f[0]&1)return -1;
     struct peer *p=NULL;
     for(unsigned i=0;i<npeers&&!p;i++)if(!memcmp(peers[i].mac,f,6))p=&peers[i];
     // Frames the switch would reject go to the switch, which drops and counts them.
     if(!p||!net_frame_source_valid(f,len,self_mac,self_ip))return -1;
-    ssize_t n=send(p->fd,f,len,MSG_DONTWAIT);
-    if(n==(ssize_t)len){p->blocked=0;p->active=now_ms();p->idle=0;tx_frames++;tx_bytes+=len;return 1;}
+    ssize_t n=send(p->fd,vnet_frame,total,MSG_DONTWAIT);
+    if(n==(ssize_t)total){p->blocked=0;p->active=now_ms();p->idle=0;tx_frames++;tx_bytes+=len;return 1;}
     if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==ENOBUFS)){
         uint64_t now=now_ms();
         if(!p->blocked)p->blocked=now;
@@ -155,17 +158,17 @@ int net_peer_poll(void){
         struct peer *p=&peers[(start+k)%count];
         if(p->dead)continue;
         if(p->deferred){
-            if(deliver(p->buf,p->deferred,NULL)<0){next_rx=(start+k)%count;goto done;}
+            if(deliver(p->buf+PEER_HDR,p->deferred-PEER_HDR,p->buf)<0){next_rx=(start+k)%count;goto done;}
             p->deferred=0;moved++;
         }
         for(unsigned budget=0;budget<PEER_RX_BUDGET;budget++){
             ssize_t n=recv(p->fd,p->buf,PEER_FRAME,MSG_DONTWAIT);
             if(n<0){if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)peer_dead(p);break;}
-            if(!net_frame_source_valid(p->buf,(size_t)n,p->mac,p->ip)){invalid_drops++;continue;}
-            rx_frames++;rx_bytes+=(uint64_t)n;p->active=now_ms();p->idle=0;
+            if(n<PEER_HDR||!net_frame_source_valid(p->buf+PEER_HDR,(size_t)n-PEER_HDR,p->mac,p->ip)){invalid_drops++;continue;}
+            rx_frames++;rx_bytes+=(uint64_t)n-PEER_HDR;p->active=now_ms();p->idle=0;
             // The guest RX ring is shared by every source: stop when it is full
             // and resume with this peer, so no peer starves another.
-            if(deliver(p->buf,(size_t)n,NULL)<0){p->deferred=(size_t)n;next_rx=(start+k)%count;goto done;}
+            if(deliver(p->buf+PEER_HDR,(size_t)n-PEER_HDR,p->buf)<0){p->deferred=(size_t)n;next_rx=(start+k)%count;goto done;}
             moved++;
         }
     }

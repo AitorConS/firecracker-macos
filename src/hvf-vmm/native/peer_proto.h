@@ -24,6 +24,10 @@
 #include <string.h>
 #define PEER_MESSAGE 32u
 #define PEER_FEATURE_DGRAM 1u
+// Every peer datagram is a 10-byte virtio_net_hdr followed by the Ethernet
+// frame, so TSO frames and partial checksums cross VMM to VMM untouched; the
+// receiving VMM adapts them to what its guest negotiated.
+#define PEER_FEATURE_VNET 2u
 enum peer_type {
     PEER_HELLO=1, PEER_WELCOME=2, PEER_ADD=3, PEER_DEL=4,
     PEER_ACK=5, PEER_DEAD=6, PEER_RESET=7, PEER_STATS=8, PEER_IDLE=9,

@@ -76,6 +76,7 @@ fn main() {
         "native/net_backend_slirp.c",
         "native/net_backend_ipc.c",
         "native/net_peer.c",
+        "native/net_gso.c",
         "native/input.c",
         "native/policy.c",
         "native/sandbox.c",
@@ -94,6 +95,7 @@ fn main() {
             "native/net_peer.h",
             "native/net_peer_relay.h",
             "native/peer_proto.h",
+            "native/net_gso.h",
             "native/net_backend_stream.h",
             "native/input.h",
         ]

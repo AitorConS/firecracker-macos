@@ -5,6 +5,7 @@ static struct budget network_budget;
 #include <Hypervisor/Hypervisor.h>
 #include "net_backend.h"
 #include "net_peer.h"
+#include "net_gso.h"
 #include <poll.h>
 #include <errno.h>
 #include <sys/mman.h>
@@ -29,6 +30,20 @@ static struct queue queues[2];
 static unsigned long rx,tx;
 static uint64_t rx_bytes,tx_bytes,drop_packets,drop_bytes;
 static uint8_t mac[6];
+// Offloads. The guest batches TCP segments into one TSO frame with a partial
+// checksum (HOST_TSO4, CSUM) and accepts such frames (GUEST_TSO4, GUEST_CSUM).
+// They cross direct peer links whole; the switch only ever sees MSS-sized
+// frames with complete checksums, segmented here.
+#define NET_F_CSUM (1U<<0)
+#define NET_F_GUEST_CSUM (1U<<1)
+#define NET_F_MAC (1U<<5)
+#define NET_F_GUEST_TSO4 (1U<<7)
+#define NET_F_HOST_TSO4 (1U<<11)
+#define NET_FEATURES (NET_F_MAC|NET_F_CSUM|NET_F_GUEST_CSUM|NET_F_GUEST_TSO4|NET_F_HOST_TSO4)
+// Segments of the TX head already handed to the switch when its socket
+// filled mid-frame; a retry continues from there instead of repeating them.
+static unsigned tx_resume;
+static uint8_t staging[65536]; // segments and completed checksums; io_lock held
 static void die(const char *why) {fprintf(stderr,"net error: %s\n",why);exit(2);}
 static uint64_t get(const void *p,unsigned n){uint64_t v=0;memcpy(&v,p,n);return v;}
 static void put(void *p,unsigned n,uint64_t v){memcpy(p,&v,n);}
@@ -62,22 +77,79 @@ static void complete(struct queue *q,uint16_t h,uint32_t n){
         isr=1;irq(1);
     }
 }
-static ssize_t receive(const void *buf,size_t len,void *opaque){
-    (void)opaque;
+// Writes header and frame into the next RX chain as one virtio packet.
+static void deliver(const uint8_t header[10],const uint8_t *frame,size_t len){
     struct queue *q=&queues[0];
-    if(!pending(q)){errno=EAGAIN;return -1;} // IPC retains one frame until the guest replenishes RX
-    if(len>65536-10)die("oversized frame");
-    if(!budget_take(&network_budget,len,1)){errno=EAGAIN;return -1;}
-    uint8_t frame[65536]={0};memcpy(frame+10,buf,len);size_t total=len+10,done=0;
+    size_t total=len+10,done=0;
     uint16_t h=head(q),i=h;unsigned count=0;
     while(done<total){
         if(++count>QSZ)die("RX cycle");struct desc d=desc(q,i);
         if(!(d.flags&2))die("RX direction");
-        size_t n=d.len<total-done?d.len:total-done;
-        memcpy(dma(d.addr,n),frame+done,n);done+=n;
+        size_t n=d.len<total-done?d.len:total-done;uint8_t *to=dma(d.addr,n);
+        for(size_t copied=0;copied<n;){
+            size_t at=done+copied,k;
+            if(at<10){k=10-at<n-copied?10-at:n-copied;memcpy(to+copied,header+at,k);}
+            else{k=n-copied;memcpy(to+copied,frame+(at-10),k);}
+            copied+=k;
+        }
+        done+=n;
         if(done<total && !(d.flags&1))die("RX buffer too small");i=d.next;
     }
-    complete(q,h,total);rx++;rx_bytes+=len;return len;
+    complete(q,h,total);rx++;rx_bytes+=len;
+}
+// opaque is the frame's virtio_net_hdr when it came from a direct peer
+// (another guest: malformed offloads are dropped, never fatal); NULL for
+// the switch, whose frames are always complete.
+static ssize_t receive(const void *buf,size_t len,void *opaque){
+    static const uint8_t plain[10];
+    struct queue *q=&queues[0];
+    if(!pending(q)){errno=EAGAIN;return -1;} // IPC retains one frame until the guest replenishes RX
+    struct vnet_hdr hd={0};
+    if(opaque){
+        vnet_hdr_decode(opaque,&hd);
+        if(len>65536-10||(hd.flags&~(VNET_F_NEEDS_CSUM|VNET_F_DATA_VALID))||
+           (hd.gso_type&&vnet_gso_count(buf,len,&hd)<0)||
+           ((hd.flags&VNET_F_NEEDS_CSUM)&&(size_t)hd.csum_start+hd.csum_offset+2>len)){
+            drop_packets++;drop_bytes+=len;return (ssize_t)len;
+        }
+    }else if(len>65536-10)die("oversized frame");
+    int tso=(features&NET_F_GUEST_TSO4)&&(features&NET_F_GUEST_CSUM);
+    if(hd.gso_type&&!tso){
+        // A guest without TSO receives the segments it would have seen on a wire.
+        int count=vnet_gso_count(buf,len,&hd);
+        if(queued(q)<(unsigned)count){errno=EAGAIN;return -1;}
+        if(!budget_take(&network_budget,len,(unsigned)count)){errno=EAGAIN;return -1;}
+        for(int s=0;s<count;s++){
+            long n=vnet_gso_segment(buf,len,&hd,(unsigned)s,staging,sizeof(staging));
+            if(n<0)die("RX segmentation");
+            deliver(plain,staging,(size_t)n);
+        }
+        return (ssize_t)len;
+    }
+    if(!budget_take(&network_budget,len,1)){errno=EAGAIN;return -1;}
+    if((hd.flags&VNET_F_NEEDS_CSUM)&&!(features&NET_F_GUEST_CSUM)){
+        memcpy(staging,buf,len);
+        if(vnet_complete_csum(staging,len,&hd))die("RX checksum offsets");
+        deliver(plain,staging,len);return (ssize_t)len;
+    }
+    deliver(opaque?opaque:plain,buf,len);return (ssize_t)len;
+}
+// The switch takes MSS-sized frames with complete checksums. Returns 1 when
+// the whole frame was handed over, 0 when its socket is full (tx_resume
+// remembers how many segments already went).
+static int to_switch(uint8_t *frame,size_t len,const struct vnet_hdr *hd){
+    if(hd->gso_type){
+        int count=vnet_gso_count(frame,len,hd);
+        if(count<0)die("TX TSO frame");
+        for(unsigned s=tx_resume;s<(unsigned)count;s++){
+            long n=vnet_gso_segment(frame,len,hd,s,staging,sizeof(staging));
+            if(n<0)die("TX TSO frame");
+            if(!net_backend_send(staging,(size_t)n)){tx_resume=s;return 0;}
+        }
+        tx_resume=0;return 1;
+    }
+    if((hd->flags&VNET_F_NEEDS_CSUM)&&vnet_complete_csum(frame,len,hd))die("TX checksum offsets");
+    return net_backend_send(frame,len);
 }
 static void transmit(void){
     struct queue *q=&queues[1];
@@ -89,13 +161,17 @@ static void transmit(void){
             memcpy(frame+len,dma(d.addr,d.len),d.len);len+=d.len;
             if(!(d.flags&1))break;i=d.next;
         }
-        if(len<24 || frame[0] || frame[1])die("TX header/offload unsupported");
-        if(!budget_take(&network_budget,len-10,1))break;
-        // A full broker socket is backpressure, not packet loss. Leave this
+        if(len<24)die("TX header");
+        struct vnet_hdr hd;vnet_hdr_decode(frame,&hd);
+        if((hd.flags&~VNET_F_NEEDS_CSUM)||((hd.flags&VNET_F_NEEDS_CSUM)&&!(features&NET_F_CSUM))||
+           (hd.gso_type&&(hd.gso_type!=VNET_GSO_TCPV4||!(features&NET_F_HOST_TSO4))))die("TX header/offload unsupported");
+        if(!tx_resume&&!budget_take(&network_budget,len-10,1))break;
+        // A full socket is backpressure, not packet loss. Leave this
         // descriptor available and retry it on the next supervisor poll.
-        // Direct peers first; everything else (and anything they refuse) uses the switch.
-        int sent=net_peer_send(frame+10,len-10);
-        if(sent<0)sent=net_backend_send(frame+10,len-10);
+        // Direct peers take the frame whole; everything else (and anything
+        // they refuse) uses the switch.
+        int sent=tx_resume?-1:net_peer_send(frame,len);
+        if(sent<0)sent=to_switch(frame+10,len-10,&hd);
         if(!sent)break;
         complete(q,h,0);tx++;tx_bytes+=len-10;
     }
@@ -103,7 +179,7 @@ static void transmit(void){
 int net_init(void *memory,size_t size,const struct hvf_options *options){
     budget_init(&network_budget,options->network_bytes_per_second,options->network_packets_per_second,256ULL<<10,256);
     memset(cfg,0,sizeof(cfg));memset(queues,0,sizeof(queues));
-    status=isr=features=selectq=rx=tx=0;bar=BAR;
+    status=isr=features=selectq=rx=tx=0;bar=BAR;tx_resume=0;
     rx_bytes=tx_bytes=drop_packets=drop_bytes=0;
     ram=memory;ram_size=size;enabled=options->network_enabled;if(!enabled)return 0;
     memcpy(mac,options->mac,6);
@@ -122,14 +198,14 @@ int net_mmio(uint64_t addr,unsigned size,int write,uint64_t *v){
     uint64_t base=bar&~15U;if(addr<base||addr>=base+4096)return 0;
     unsigned off=addr-base;struct queue *q=selectq<2?&queues[selectq]:NULL;
     if(write){switch(off){
-        case 4:if(size!=4||(*v&~(1U<<5)))return 0;features=*v;break;
+        case 4:if(size!=4||(*v&~NET_FEATURES))return 0;features=*v;break;
         case 8:if(size!=4||!q)return 0;*q=(struct queue){.pfn=*v};break;
         case 14:if(size!=2)return 0;selectq=*v;break;
         case 16:if(size!=2||*v>1)return 0;if(*v==1)transmit();break;
-        case 18:if(size!=1)return 0;status=*v;if(!status){memset(queues,0,sizeof(queues));features=0;isr=0;irq(0);}break;
+        case 18:if(size!=1)return 0;status=*v;if(!status){memset(queues,0,sizeof(queues));features=0;isr=0;tx_resume=0;irq(0);}break;
         default:return 0;
     }}else{switch(off){
-        case 0:*v=1U<<5;break;
+        case 0:*v=NET_FEATURES;break;
         case 4:*v=features;break;
         case 8:*v=q?q->pfn:0;break;
         case 12:*v=q?QSZ:0;break;

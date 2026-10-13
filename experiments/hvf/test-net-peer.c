@@ -159,6 +159,17 @@ static void test_data_plane(void){
     for(int i=0;i<4&&!found;i++){net_peer_poll();if(read_message(channel[1],&m)<0&&m.type==PEER_STATS)found=1;}
     assert(found&&m.epoch>0&&m.value>0);
 
+    // A new switch session gets the cumulative statistics without waiting for new traffic.
+    send_message(channel[1],&welcome,-1);
+    found=0;
+    for(int i=0;i<4&&!found;i++){net_peer_poll();if(read_message(channel[1],&m)<0&&m.type==PEER_STATS)found=1;}
+    assert(found&&m.epoch>0);
+    assert(net_peer_send(f,size)==-1); // the new session dropped the old link
+    close(link[1]);
+    assert(!socketpair(AF_UNIX,SOCK_DGRAM,0,link));size_link(link[1]);
+    send_message(channel[1],&add,link[0]);close(link[0]);net_peer_poll();
+    assert(read_message(channel[1],&m)<0&&m.type==PEER_ACK&&m.flags==1);
+
     // PEER_DEL and RESET return the destination to the switch.
     struct peer_message del={.type=PEER_DEL,.epoch=7,.value=42};
     send_message(channel[1],&del,-1);net_peer_poll();
@@ -180,7 +191,8 @@ static void test_data_plane(void){
     close(link[1]);
     assert(net_peer_send(f,size)==-1);
     net_peer_poll();
-    assert(read_message(channel[1],&m)<0&&m.type==PEER_DEAD&&m.value==42);
+    do assert(read_message(channel[1],&m)<0); while(m.type==PEER_STATS); // the session start reports statistics
+    assert(m.type==PEER_DEAD&&m.value==42);
     net_peer_close();close(channel[1]);
 }
 static void test_relay(void){

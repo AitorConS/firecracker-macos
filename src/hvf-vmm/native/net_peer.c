@@ -83,7 +83,11 @@ static int peer_add(const struct peer_message *m,int fd){
 static void control(const struct peer_message *m,int fd){
     switch(m->type){
     case PEER_WELCOME:
-        if(fd<0&&m->epoch&&!memcmp(m->mac,self_mac,6)){drop_all();epoch=m->epoch;memcpy(self_ip,m->ip,4);}
+        if(fd<0&&m->epoch&&!memcmp(m->mac,self_mac,6)){
+            drop_all();epoch=m->epoch;memcpy(self_ip,m->ip,4);
+            // A new switch session starts with no statistics: report any at once.
+            if(tx_bytes||rx_bytes){sent_tx=sent_rx=UINT64_MAX;next_stats=0;}
+        }
         break;
     case PEER_ADD:{
         int accepted=fd>=0&&peer_add(m,fd);

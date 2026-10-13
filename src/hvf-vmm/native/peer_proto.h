@@ -13,7 +13,8 @@
 // switch -> VMM: WELCOME{epoch, own MAC, own IP}, PEER_ADD{epoch, id, MAC, IP}
 //   with exactly one SCM_RIGHTS descriptor, PEER_DEL{epoch, id}.
 // VMM -> switch: HELLO{features, own MAC}, PEER_ACK{epoch, id, flags=accepted},
-//   PEER_DEAD{epoch, id}, STATS{TX bytes, RX bytes}.
+//   PEER_DEAD{epoch, id}, STATS{TX bytes, RX bytes}, PEER_IDLE{epoch, id}
+//   (no frames either way for a while: the switch may withdraw the link).
 // broker -> VMM only: RESET (the switch connection was lost; drop every peer).
 //
 // The sender keeps its reference to a descriptor until PEER_ACK: XNU unp_gc
@@ -25,7 +26,7 @@
 #define PEER_FEATURE_DGRAM 1u
 enum peer_type {
     PEER_HELLO=1, PEER_WELCOME=2, PEER_ADD=3, PEER_DEL=4,
-    PEER_ACK=5, PEER_DEAD=6, PEER_RESET=7, PEER_STATS=8,
+    PEER_ACK=5, PEER_DEAD=6, PEER_RESET=7, PEER_STATS=8, PEER_IDLE=9,
 };
 struct peer_message {
     uint8_t type,flags;
@@ -42,7 +43,7 @@ static inline void peer_encode(uint8_t out[PEER_MESSAGE],const struct peer_messa
 }
 // 0 on success, -1 for anything that is not a well-formed message.
 static inline int peer_decode(const uint8_t in[PEER_MESSAGE],struct peer_message *m){
-    if(memcmp(in,"JPC1",4)||in[6]||in[7]||in[4]<PEER_HELLO||in[4]>PEER_STATS)return -1;
+    if(memcmp(in,"JPC1",4)||in[6]||in[7]||in[4]<PEER_HELLO||in[4]>PEER_IDLE)return -1;
     memset(m,0,sizeof(*m));m->type=in[4];m->flags=in[5];
     for(unsigned i=0;i<8;i++)m->epoch|=(uint64_t)in[8+i]<<(8*i);
     unsigned width=m->type==PEER_STATS?8:4;

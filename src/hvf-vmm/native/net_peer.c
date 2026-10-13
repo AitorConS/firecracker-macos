@@ -16,15 +16,20 @@
 // frames, as the switch's bounded writer does, so it never blocks the TX ring.
 #define PEER_STALL_MS 100
 #define PEER_STATS_MS 1000
+// A link without frames either way for this long is reported idle once, so
+// the switch can reclaim it; traffic that resumes re-creates it on demand.
+#ifndef PEER_IDLE_MS
+#define PEER_IDLE_MS 60000
+#endif
 struct peer {
     uint64_t id;int fd,dead;uint8_t mac[6],ip[4];
-    uint64_t blocked;size_t deferred;uint8_t *buf;
+    uint64_t blocked,active;size_t deferred;uint8_t *buf;int idle;
 };
 static struct peer peers[PEER_MAX];
 static unsigned npeers,next_rx;
 static int channel=-1;
 static uint8_t self_mac[6],self_ip[4];
-static uint64_t epoch,next_stats,sent_tx,sent_rx;
+static uint64_t epoch,next_stats,next_idle,sent_tx,sent_rx;
 static net_peer_receive_fn deliver;
 static uint64_t tx_frames,rx_frames,tx_bytes,rx_bytes,invalid_drops,stalled_drops;
 
@@ -77,7 +82,7 @@ static int peer_add(const struct peer_message *m,int fd){
     uint8_t *buf=npeers<PEER_MAX?malloc(PEER_FRAME):NULL;
     if(!buf)return 0;
     struct peer *p=&peers[npeers++];
-    *p=(struct peer){.id=m->value,.fd=fd,.buf=buf};memcpy(p->mac,m->mac,6);memcpy(p->ip,m->ip,4);
+    *p=(struct peer){.id=m->value,.fd=fd,.buf=buf,.active=now_ms()};memcpy(p->mac,m->mac,6);memcpy(p->ip,m->ip,4);
     return 1;
 }
 static void control(const struct peer_message *m,int fd){
@@ -133,7 +138,7 @@ int net_peer_send(const uint8_t *f,size_t len){
     // Frames the switch would reject go to the switch, which drops and counts them.
     if(!p||!net_frame_source_valid(f,len,self_mac,self_ip))return -1;
     ssize_t n=send(p->fd,f,len,MSG_DONTWAIT);
-    if(n==(ssize_t)len){p->blocked=0;tx_frames++;tx_bytes+=len;return 1;}
+    if(n==(ssize_t)len){p->blocked=0;p->active=now_ms();p->idle=0;tx_frames++;tx_bytes+=len;return 1;}
     if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==ENOBUFS)){
         uint64_t now=now_ms();
         if(!p->blocked)p->blocked=now;
@@ -157,7 +162,7 @@ int net_peer_poll(void){
             ssize_t n=recv(p->fd,p->buf,PEER_FRAME,MSG_DONTWAIT);
             if(n<0){if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)peer_dead(p);break;}
             if(!net_frame_source_valid(p->buf,(size_t)n,p->mac,p->ip)){invalid_drops++;continue;}
-            rx_frames++;rx_bytes+=(uint64_t)n;
+            rx_frames++;rx_bytes+=(uint64_t)n;p->active=now_ms();p->idle=0;
             // The guest RX ring is shared by every source: stop when it is full
             // and resume with this peer, so no peer starves another.
             if(deliver(p->buf,(size_t)n,NULL)<0){p->deferred=(size_t)n;next_rx=(start+k)%count;goto done;}
@@ -171,6 +176,13 @@ done:
     if(channel>=0&&now>=next_stats&&(tx_bytes!=sent_tx||rx_bytes!=sent_rx)){
         channel_send(&(struct peer_message){.type=PEER_STATS,.epoch=tx_bytes,.value=rx_bytes});
         sent_tx=tx_bytes;sent_rx=rx_bytes;next_stats=now+PEER_STATS_MS;
+    }
+    if(channel>=0&&now>=next_idle){
+        for(unsigned i=0;i<npeers;i++)if(!peers[i].idle&&now-peers[i].active>=PEER_IDLE_MS){
+            peers[i].idle=1;
+            channel_send(&(struct peer_message){.type=PEER_IDLE,.epoch=epoch,.value=peers[i].id});
+        }
+        next_idle=now+(PEER_IDLE_MS<PEER_STATS_MS?PEER_IDLE_MS/4:PEER_STATS_MS);
     }
     return moved;
 }

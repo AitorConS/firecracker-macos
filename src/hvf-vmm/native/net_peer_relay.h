@@ -123,7 +123,7 @@ static void relay_from_vmm(void){
         ssize_t n=recv(relay.channel,wire,sizeof(wire),MSG_DONTWAIT);
         if(n<0)return;
         struct peer_message m;
-        if(n!=PEER_MESSAGE||peer_decode(wire,&m)||(m.type!=PEER_ACK&&m.type!=PEER_DEAD&&m.type!=PEER_STATS))continue;
+        if(n!=PEER_MESSAGE||peer_decode(wire,&m)||(m.type!=PEER_ACK&&m.type!=PEER_DEAD&&m.type!=PEER_STATS&&m.type!=PEER_IDLE))continue;
         if(m.type==PEER_ACK)relay_release(m.value);
         if(relay.ctl>=0&&!relay.connecting&&relay_to_switch(&m))return;
     }

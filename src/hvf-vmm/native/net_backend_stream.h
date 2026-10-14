@@ -2,6 +2,7 @@
 // QEMU stream Ethernet client. Fixed memory, nonblocking I/O, reconnect on EOF.
 #pragma once
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <poll.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -41,7 +42,8 @@ static int stream_peer(void) {
     return getpeereid(stream.fd,&uid,&gid)==0 && uid==geteuid();
 }
 static void stream_connect(void) {
-    if(stream.fd>=0 || stream_ms()<stream.retry)return;
+    // A stream adopted from the broker has no path: only the broker connects.
+    if(!stream.path || stream.fd>=0 || stream_ms()<stream.retry)return;
     struct stat st;
     if(lstat(stream.path,&st)||!S_ISSOCK(st.st_mode)||st.st_uid!=geteuid()||(st.st_mode&0077)){
         stream.retry=stream_ms()+1000;return;
@@ -80,6 +82,27 @@ static void stream_send(const void *data,size_t size) {
     stream_flush();if(stream.fd<0||stream.queued){stream.drops++;stream.drop_bytes+=size;return;}
     for(unsigned i=0;i<4;i++)stream.tx[i]=(uint8_t)(size>>(24-8*i));
     memcpy(stream.tx+4,data,size);stream.queued=size+4;stream.tx_progress=stream_ms();stream_flush();
+}
+// Sender that owns the link directly (the VMM): a full socket is
+// backpressure, never loss. Returns 1 once the frame is written, or queued
+// behind a partial write, and 0 while an earlier frame is still queued or
+// nothing could be written (the caller retains the frame and retries).
+static int stream_offer(const void *data,size_t size) {
+    if(size<14||size>STREAM_FRAME||stream.fd<0){stream.drops++;stream.drop_bytes+=size;return 1;}
+    stream_flush();
+    if(stream.fd<0){stream.drops++;stream.drop_bytes+=size;return 1;}
+    if(stream.queued)return 0;
+    uint8_t length[4];for(unsigned i=0;i<4;i++)length[i]=(uint8_t)(size>>(24-8*i));
+    struct iovec parts[2]={{length,4},{(void *)data,size}};
+    ssize_t n=writev(stream.fd,parts,2);
+    if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR))return 0;
+    if(n<=0){stream_disconnect();stream.drops++;stream.drop_bytes+=size;return 1;}
+    stream.tx_progress=stream_ms();
+    if((size_t)n==size+4)return 1;
+    // Keep the unsent tail so the stream never carries part of a frame.
+    memcpy(stream.tx,length,4);memcpy(stream.tx+4,data,size);
+    stream.queued=size+4;stream.sent=(size_t)n;
+    return 1;
 }
 static void stream_poll(void) {
     if(stream.paused)return;

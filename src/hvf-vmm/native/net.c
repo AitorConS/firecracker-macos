@@ -216,6 +216,7 @@ int net_mmio(uint64_t addr,unsigned size,int write,uint64_t *v){
     }}return 1;
 }
 int net_pending_tx(void){return enabled && pending(&queues[1]);}
+int net_wait_fd(void){return enabled?net_backend_wait_fd():-1;}
 int net_poll(void){
     if(!enabled)return 0;
     unsigned long before_tx=tx,before_rx=rx;

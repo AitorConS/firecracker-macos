@@ -23,6 +23,7 @@ int net_backend_open(const struct hvf_options *o,net_receive_fn cb){(void)o;rece
 int net_backend_send(const void *p,size_t n){(void)p;(void)n;return 1;}
 void net_backend_poll(void){}
 void net_backend_close(void){receive_packet=NULL;}
+int net_backend_wait_fd(void){return -1;}
 static void put(size_t off,unsigned size,uint64_t value){memcpy(ram+off,&value,size);}
 static void desc(unsigned i,uint64_t addr,uint32_t len,uint16_t flags,uint16_t next){
     size_t off=0x10000+16*i;put(off,8,addr);put(off+8,4,len);put(off+12,2,flags);put(off+14,2,next);

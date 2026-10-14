@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdint.h>
@@ -434,6 +435,7 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
         pthread_mutex_lock(&io_lock);
         int network_active=0;
         if(phase<3){devices_poll();network_active=net_poll();}else net_backend_health();
+        int wake_fd=phase==0?net_wait_fd():-1;
         if(phase==1 && parked_cpus()==(int)ncpus && !devices_pending() && !net_pending_tx()){
             paused_ticks=mach_absolute_time();
             net_backend_pause(1,transition);phase=2;
@@ -478,7 +480,14 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
         // network responsive during a burst without spinning while idle.
         if(phase==0 && network_active)network_hot_polls=20;
         else if(network_hot_polls)network_hot_polls--;
-        usleep(phase==0 && network_hot_polls?100:1000);
+        unsigned sleep_us=phase==0 && network_hot_polls?100:1000;
+        // A switch that lets only a few KiB into the socket (older jerboad) would cap
+        // throughput at one buffer per interval: its link ends the sleep early instead.
+        // The descriptor may close meanwhile: select then returns early, which is harmless.
+        if(wake_fd>=0 && wake_fd<FD_SETSIZE){
+            fd_set readable;FD_ZERO(&readable);FD_SET(wake_fd,&readable);
+            struct timeval wait={0,(int)sleep_us};(void)select(wake_fd+1,&readable,NULL,NULL,&wait);
+        }else usleep(sleep_us);
     }
     pthread_mutex_lock(&state_lock);pthread_cond_broadcast(&state_change);pthread_mutex_unlock(&state_lock);
     // Block workers raise interrupts: stop them while vCPUs and the GIC exist.

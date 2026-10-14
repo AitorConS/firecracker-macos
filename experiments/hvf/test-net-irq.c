@@ -37,6 +37,7 @@ int net_backend_send(const void *data,size_t size){
 void net_backend_poll(void){}
 void net_backend_close(void){deliver=NULL;}
 void net_backend_health(void){}
+int net_backend_wait_fd(void){return -1;}
 
 static void write_reg(unsigned offset,unsigned width,uint64_t value){
     assert(net_mmio(BAR+offset,width,1,&value));

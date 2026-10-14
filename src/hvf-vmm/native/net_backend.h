@@ -13,6 +13,8 @@ void net_backend_pause(int paused, uint64_t operation);
 int net_backend_pause_ready(uint64_t operation);
 void net_backend_health(void);
 int net_backend_pending_rx(void);
+// Descriptor the VMM may sleep on for guest RX, or -1 to sleep for its poll interval.
+int net_backend_wait_fd(void);
 void slirp_backend_pause(int paused);
 
 // Internal broker transport, also exercised by the stack fuzzer.

@@ -42,6 +42,10 @@ static int broker_stream;
 enum {LINK_OFFER='S',LINK_ACK='A',LINK_LOST='R'};
 static uint64_t link_generation;   // VMM: generation of the adopted link (0: none)
 static int link_lost;              // VMM: LINK_LOST sent for link_generation
+// VMM: polls that ended inside a frame. A switch whose socket buffer is smaller
+// than a frame (older jerboad: 8 KiB) leaves one there every time.
+static unsigned link_partial_polls;
+#define LINK_PARTIAL_POLLS 32
 static int link_message(int fd,uint8_t kind,uint64_t generation,int descriptor){
     uint8_t wire[LINK_MESSAGE]={'H','V','L','K',kind};
     for(unsigned i=0;i<8;i++)wire[8+i]=(uint8_t)(generation>>(8*i));
@@ -256,7 +260,7 @@ static void link_service(void){
         stream.fd=descriptor;stream.connecting=0;stream.used=0;stream.need=4;stream.rx_start=stream.rx_used=0;
         stream.queued=stream.sent=0;stream.progress=stream.tx_progress=stream_ms();stream.paused=paused;
         if(!link_generation)fprintf(stderr,"network: direct link to the switch\n");
-        link_generation=generation;link_lost=0;
+        link_generation=generation;link_lost=0;link_partial_polls=0;
         if(link_message(link_channel,LINK_ACK,generation,-1))fail("link acknowledgement");
     }
     if(link_generation&&!link_lost&&stream.fd<0){
@@ -267,7 +271,11 @@ static void link_service(void){
 void net_backend_poll(void){
     uint8_t packet[65537];
     net_backend_health();
-    if(link_generation&&!link_lost){stream_poll();link_service();}
+    if(link_generation&&!link_lost){
+        stream_poll();
+        if(stream.used>0&&stream.used<stream.need&&link_partial_polls<LINK_PARTIAL_POLLS)link_partial_polls++;
+        link_service();
+    }
     if(deferred_size){if(receive_frame(deferred_frame,deferred_size,NULL)<0)return;deferred_size=0;}
     for(unsigned budget=0;budget<256;budget++){
         ssize_t n=recv(frames,packet,sizeof(packet),MSG_DONTWAIT);
@@ -307,6 +315,15 @@ void net_backend_pause(int paused,uint64_t operation){
     if(control_send(health,paused?'P':'U',operation))fail("pause control send");
 }
 int net_backend_pause_ready(uint64_t operation){net_backend_health();return pause_ack==operation;}
+int net_backend_wait_fd(void){
+    // Whole frames arrive in batches the poll interval collects cheaply. Only a
+    // switch that hands over a frame in pieces needs a wakeup for each piece.
+    if(link_partial_polls<LINK_PARTIAL_POLLS)return -1;
+    if(!link_generation||link_lost||stream.fd<0||stream.connecting||stream.paused)return -1;
+    // A frame held back by guest backpressure keeps the link readable: only the poll interval retries it.
+    if(stream.need>4&&stream.used==stream.need)return -1;
+    return stream.fd;
+}
 int net_backend_pending_rx(void){
     if(frames<0)return 0;
     if(deferred_size)return 1;

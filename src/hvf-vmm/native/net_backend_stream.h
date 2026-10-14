@@ -13,6 +13,9 @@
 #include "net_backend.h"
 #define STREAM_FRAME 65536u
 #define STREAM_RX_CAPACITY (2u * (STREAM_FRAME + 4u))
+// macOS gives Unix stream sockets 8 KiB buffers, less than one 9000-byte frame,
+// so each frame took several partial sends and wakeups on both sides.
+#define STREAM_SOCKET_BUFFER (1 << 20)
 static struct {
     int fd, connecting, paused;
     const char *path;
@@ -45,7 +48,10 @@ static void stream_connect(void) {
     }
     stream.fd=socket(AF_UNIX,SOCK_STREAM,0);
     if(stream.fd<0){stream_disconnect();return;}
-    int one=1;
+    int one=1,buffer=STREAM_SOCKET_BUFFER;
+    // Best effort: the kernel caps buffers at kern.ipc.maxsockbuf.
+    (void)setsockopt(stream.fd,SOL_SOCKET,SO_SNDBUF,&buffer,sizeof(buffer));
+    (void)setsockopt(stream.fd,SOL_SOCKET,SO_RCVBUF,&buffer,sizeof(buffer));
     if(fcntl(stream.fd,F_SETFL,O_NONBLOCK)||fcntl(stream.fd,F_SETFD,FD_CLOEXEC)||
        setsockopt(stream.fd,SOL_SOCKET,SO_NOSIGPIPE,&one,sizeof(one))){stream_disconnect();return;}
     struct sockaddr_un addr={.sun_family=AF_UNIX};

@@ -97,14 +97,45 @@ static void deliver(const uint8_t header[10],const uint8_t *frame,size_t len){
     }
     complete(q,h,total);rx++;rx_bytes+=len;
 }
+// Switch capabilities (jerboad, EtherType 0x88B5 "JRBC"). A switch that takes
+// whole TSO frames for its gateway says so, with the gateway's MAC and MTU,
+// in the first frame of each link; the VMM answers that it takes them too.
+// Without that frame (older jerboad) every TSO frame is segmented as before.
+#define SWITCH_CAPS_TYPE 0x88b5
+#define SWITCH_CAPS_SIZE 60
+#define SWITCH_CAPS_LARGE 1u
+static struct {uint8_t gateway[6];unsigned mtu;int large,answer;} switch_caps;
+static int switch_capabilities(const uint8_t *f,size_t len){
+    if(len<14||(f[12]<<8|f[13])!=SWITCH_CAPS_TYPE)return 0;
+    unsigned mtu=len>=22?(unsigned)(f[20]<<8|f[21]):0;
+    // Malformed or foreign capability frames are consumed and ignored.
+    if(len<22||memcmp(f+14,"JRBC",4)||f[18]!=1||memcmp(f,mac,6)||mtu<576||mtu>9000)return 1;
+    memcpy(switch_caps.gateway,f+6,6);switch_caps.mtu=mtu;
+    switch_caps.large=(f[19]&SWITCH_CAPS_LARGE)!=0;switch_caps.answer=1;
+    return 1;
+}
+static void answer_switch(void){
+    if(!switch_caps.answer)return;
+    uint8_t f[SWITCH_CAPS_SIZE]={0};
+    memcpy(f,switch_caps.gateway,6);memcpy(f+6,mac,6);f[12]=SWITCH_CAPS_TYPE>>8;f[13]=SWITCH_CAPS_TYPE&0xff;
+    memcpy(f+14,"JRBC",4);f[18]=1;f[19]=SWITCH_CAPS_LARGE;
+    if(net_backend_send(f,sizeof(f)))switch_caps.answer=0;
+}
 // opaque is the frame's virtio_net_hdr when it came from a direct peer
 // (another guest: malformed offloads are dropped, never fatal); NULL for
-// the switch, whose frames are always complete.
+// the switch, whose frames have complete checksums except the whole TSO
+// frames its capabilities announced.
 static ssize_t receive(const void *buf,size_t len,void *opaque){
     static const uint8_t plain[10];
     struct queue *q=&queues[0];
+    if(!opaque&&switch_capabilities(buf,len))return (ssize_t)len;
     if(!pending(q)){errno=EAGAIN;return -1;} // IPC retains one frame until the guest replenishes RX
     struct vnet_hdr hd={0};
+    uint8_t described[VNET_HDR];
+    if(!opaque&&switch_caps.mtu&&len>switch_caps.mtu+14u){
+        if(vnet_gso_describe(buf,len,switch_caps.mtu,&hd)){drop_packets++;drop_bytes+=len;return (ssize_t)len;}
+        vnet_hdr_encode(described,&hd);opaque=described;
+    }
     if(opaque){
         vnet_hdr_decode(opaque,&hd);
         if(len>65536-10||(hd.flags&~(VNET_F_NEEDS_CSUM|VNET_F_DATA_VALID))||
@@ -134,10 +165,13 @@ static ssize_t receive(const void *buf,size_t len,void *opaque){
     }
     deliver(opaque?opaque:plain,buf,len);return (ssize_t)len;
 }
-// The switch takes MSS-sized frames with complete checksums. Returns 1 when
-// the whole frame was handed over, 0 when its socket is full (tx_resume
+// The switch takes MSS-sized frames with complete checksums, and whole TSO
+// frames for a gateway that announced it takes them. Returns 1 when the
+// whole frame was handed over, 0 when its socket is full (tx_resume
 // remembers how many segments already went).
 static int to_switch(uint8_t *frame,size_t len,const struct vnet_hdr *hd){
+    if(hd->gso_type&&!tx_resume&&switch_caps.large&&!memcmp(frame,switch_caps.gateway,6)&&!vnet_gso_whole(frame,len,hd))
+        return net_backend_send(frame,len);
     if(hd->gso_type){
         int count=vnet_gso_count(frame,len,hd);
         if(count<0)die("TX TSO frame");
@@ -179,7 +213,7 @@ static void transmit(void){
 int net_init(void *memory,size_t size,const struct hvf_options *options){
     budget_init(&network_budget,options->network_bytes_per_second,options->network_packets_per_second,256ULL<<10,256);
     memset(cfg,0,sizeof(cfg));memset(queues,0,sizeof(queues));
-    status=isr=features=selectq=rx=tx=0;bar=BAR;tx_resume=0;
+    status=isr=features=selectq=rx=tx=0;bar=BAR;tx_resume=0;memset(&switch_caps,0,sizeof(switch_caps));
     rx_bytes=tx_bytes=drop_packets=drop_bytes=0;
     ram=memory;ram_size=size;enabled=options->network_enabled;if(!enabled)return 0;
     memcpy(mac,options->mac,6);
@@ -220,7 +254,7 @@ int net_wait_fd(void){return enabled?net_backend_wait_fd():-1;}
 int net_poll(void){
     if(!enabled)return 0;
     unsigned long before_tx=tx,before_rx=rx;
-    transmit();net_backend_poll();net_peer_poll();
+    answer_switch();transmit();net_backend_poll();net_peer_poll();
     return tx!=before_tx||rx!=before_rx;
 }
 void net_close(void){if(enabled){fprintf(stderr,"network: TX=%lu RX=%lu\n",tx,rx);net_peer_close();net_backend_close();enabled=0;}}

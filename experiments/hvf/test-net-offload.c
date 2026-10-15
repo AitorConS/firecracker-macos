@@ -163,12 +163,67 @@ static void test_rx_from_peer(void){
     uint8_t plain[60]={0};
     assert(receive(plain,sizeof(plain),NULL)==sizeof(plain)&&*used_idx(RX_RING)==1&&rx_packet(0)[0]==0);
 }
+static size_t switch_caps(uint8_t *f,uint8_t version){
+    memset(f,0,60);
+    memcpy(f+6,"\x02\0\0\0\0\x02",6); // gateway; the VM's MAC is all zeros here
+    f[12]=0x88;f[13]=0xb5;memcpy(f+14,"JRBC",4);f[18]=version;f[19]=1;f[20]=9000>>8;f[21]=9000&0xff;
+    return 60;
+}
+static void test_switch_capabilities(void){
+    static uint8_t packet[65536];uint8_t caps[60];
+    uint64_t metrics[6];
+    setup(FEATURES);reset_slots();sends=0;
+
+    // An unknown version is consumed, never answered or delivered.
+    assert(receive(caps,switch_caps(caps,2),NULL)==60);
+    net_poll();assert(sends==0&&*used_idx(RX_RING)==0);
+    // Capabilities need no RX buffer and are answered on the next poll.
+    assert(receive(caps,switch_caps(caps,1),NULL)==60&&*used_idx(RX_RING)==0);
+    net_poll();
+    assert(sends==1&&sent_len[0]==60&&!memcmp(sent[0],"\x02\0\0\0\0\x02",6)&&sent[0][12]==0x88&&sent[0][13]==0xb5);
+    assert(!memcmp(sent[0]+14,"JRBC\x01\x01",6));
+
+    // A TSO frame for the gateway goes whole, with a consistent IPv4 header.
+    sends=0;size_t len=tso_packet(packet,5000,1000);
+    tx(packet,len);
+    assert(sends==1&&sent_len[0]==len-10&&!memcmp(sent[0]+ETH+40,packet+10+ETH+40,5000));
+    const uint8_t *ip=sent[0]+ETH;
+    assert((ip[2]<<8|ip[3])==40+5000&&ref_fold(ref_sum(0,ip,20))==0xffff);
+    // Anything else on the switch is still segmented.
+    sends=0;len=tso_packet(packet,5000,1000);packet[10+5]=0x03;
+    tx(packet,len);
+    assert(sends==5&&tcp_valid(sent[0],sent_len[0]));
+
+    // A whole TSO frame from the gateway reaches a TSO guest as one, described.
+    len=tso_packet(packet,30000,0);
+    post_rx(1,65536);
+    assert(receive(packet+10,len-10,NULL)==(ssize_t)(len-10));
+    assert(*used_idx(RX_RING)==1&&*used_len(RX_RING,0)==len);
+    struct vnet_hdr h;vnet_hdr_decode(rx_packet(0),&h);
+    assert(h.gso_type==VNET_GSO_TCPV4&&h.gso_size==9000-40&&h.flags==VNET_F_NEEDS_CSUM&&h.csum_start==ETH+20&&h.csum_offset==16);
+    assert(!memcmp(rx_packet(0)+10,packet+10,len-10));
+    // A guest without offloads gets checksummed MTU segments.
+    setup(0x20);reset_slots();post_rx(4,9100);
+    assert(receive(packet+10,len-10,NULL)==(ssize_t)(len-10));
+    assert(*used_idx(RX_RING)==4);
+    for(unsigned i=0;i<4;i++){
+        const uint8_t *p=rx_packet(i);size_t n=*used_len(RX_RING,i)-10;
+        assert(n==ETH+40+(i<3?8960:30000-3*8960)&&tcp_valid(p+10,n));
+    }
+    // An oversized frame that is not whole TCPv4 is dropped, never fatal.
+    setup(FEATURES);reset_slots();post_rx(1,65536);
+    net_metrics(metrics);uint64_t drops=metrics[4];
+    packet[10+ETH+9]=17;
+    assert(receive(packet+10,len-10,NULL)==(ssize_t)(len-10));
+    net_metrics(metrics);assert(metrics[4]==drops+1&&*used_idx(RX_RING)==0);
+}
 int main(void){
     memory=calloc(1,SIZE);assert(memory);
     struct hvf_options options={.network_enabled=1};
     assert(net_init(memory,SIZE,&options)==0);
     test_tx_to_switch();
     test_rx_from_peer();
+    test_switch_capabilities();
     net_close();free(memory);
     puts("net-offload: ok");
     return 0;

@@ -17,14 +17,15 @@
 // macOS gives Unix stream sockets 8 KiB buffers, less than one 9000-byte frame,
 // so each frame took several partial sends and wakeups on both sides.
 #define STREAM_SOCKET_BUFFER (1 << 20)
+#define STREAM_TX_CAPACITY (1024u * 1024u)
 static struct {
     int fd, connecting, paused;
     const char *path;
     net_receive_fn receive;
-    uint8_t rx[STREAM_RX_CAPACITY], tx[STREAM_FRAME+4];
+    uint8_t rx[STREAM_RX_CAPACITY], tx[STREAM_TX_CAPACITY];
     // used/need describe the current frame for the broker's blocked_rx check.
     // rx_start/rx_used delimit buffered bytes; later frames remain in place.
-    size_t used, need, rx_start, rx_used, sent, queued;
+    size_t used, need, rx_start, rx_used, sent, queued, tx_head;
     uint64_t retry, progress, tx_progress, drops, drop_bytes;
 } stream = {.fd=-1};
 static uint64_t stream_ms(void) {
@@ -34,8 +35,12 @@ static uint64_t stream_ms(void) {
 static void stream_disconnect(void) {
     if(stream.fd>=0)close(stream.fd);
     stream.fd=-1;stream.connecting=0;stream.used=0;stream.need=4;stream.rx_start=stream.rx_used=0;
-    if(stream.queued){stream.drops++;stream.drop_bytes+=stream.queued-4;}
-    stream.queued=stream.sent=0;stream.retry=stream_ms()+1000;
+    for(size_t offset=stream.tx_head;offset<stream.queued;){
+        uint32_t size=0;
+        for(unsigned i=0;i<4;i++)size=(size<<8)|stream.tx[offset+i];
+        stream.drops++;stream.drop_bytes+=size;offset+=size+4;
+    }
+    stream.queued=stream.sent=stream.tx_head=0;stream.retry=stream_ms()+1000;
 }
 static int stream_peer(void) {
     uid_t uid;gid_t gid;
@@ -69,19 +74,37 @@ static int stream_open(const struct hvf_options *options,net_receive_fn receive)
 }
 static void stream_flush(void) {
     while(stream.fd>=0 && !stream.connecting && stream.sent<stream.queued){
-        ssize_t n=send(stream.fd,stream.tx+stream.sent,stream.queued-stream.sent,0);
+        uint32_t size=0;
+        for(unsigned i=0;i<4;i++)size=(size<<8)|stream.tx[stream.tx_head+i];
+        size_t end=stream.tx_head+size+4;
+        ssize_t n=send(stream.fd,stream.tx+stream.sent,end-stream.sent,0);
         if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR))return;
-        if(n<=0){stream_disconnect();return;}stream.sent+=(size_t)n;stream.tx_progress=stream_ms();
+        if(n<=0){stream_disconnect();return;}
+        stream.sent+=(size_t)n;stream.tx_progress=stream_ms();
+        if(stream.sent==end)stream.tx_head=end;
     }
-    if(stream.sent==stream.queued)stream.sent=stream.queued=0;
+    if(stream.sent==stream.queued)stream.sent=stream.queued=stream.tx_head=0;
 }
-// One bounded pending frame. Saturation drops whole Ethernet frames, never bytes
-// from a partially transmitted frame. VirtIO's aggregate quotas apply upstream.
+// A bounded byte queue absorbs ordinary VirtIO bursts. Saturation still drops
+// whole new frames; a partially transmitted frame is retained until completion.
 static void stream_send(const void *data,size_t size) {
     if(size<14||size>STREAM_FRAME)return;
-    stream_flush();if(stream.fd<0||stream.queued){stream.drops++;stream.drop_bytes+=size;return;}
-    for(unsigned i=0;i<4;i++)stream.tx[i]=(uint8_t)(size>>(24-8*i));
-    memcpy(stream.tx+4,data,size);stream.queued=size+4;stream.tx_progress=stream_ms();stream_flush();
+    stream_flush();
+    if(stream.fd<0 || size+4>sizeof(stream.tx)-(stream.queued-stream.tx_head)){
+        stream.drops++;stream.drop_bytes+=size;return;
+    }
+    if(size+4>sizeof(stream.tx)-stream.queued){
+        memmove(stream.tx,stream.tx+stream.tx_head,stream.queued-stream.tx_head);
+        stream.queued-=stream.tx_head;stream.sent-=stream.tx_head;stream.tx_head=0;
+    }
+    // New arrivals must not extend a stalled writer's timeout indefinitely.
+    if(!stream.queued)stream.tx_progress=stream_ms();
+    for(unsigned i=0;i<4;i++)stream.tx[stream.queued+i]=(uint8_t)(size>>(24-8*i));
+    memcpy(stream.tx+stream.queued+4,data,size);stream.queued+=size+4;
+    stream_flush();
+}
+static int stream_can_send(void) {
+    return stream.fd>=0 && STREAM_FRAME+4<=sizeof(stream.tx)-(stream.queued-stream.tx_head);
 }
 // Sender that owns the link directly (the VMM): a full socket is
 // backpressure, never loss. Returns 1 once the frame is written, or queued
@@ -128,7 +151,12 @@ static void stream_poll(void) {
         if(stream.used==stream.need){
             // Keep used==need if the callback applies backpressure: the broker
             // uses that condition to stop polling the stream socket for RX.
-            if(stream.receive(stream.rx+stream.rx_start+4,stream.need-4,NULL)<0)return;
+            // Temporary backpressure retries later; other failures reconnect.
+            if(stream.receive(stream.rx+stream.rx_start+4,stream.need-4,NULL)<0){
+                if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=ENOBUFS&&errno!=EINTR)
+                    stream_disconnect();
+                return;
+            }
             stream.rx_start+=stream.need;
             stream.rx_used-=stream.need;
             if(!stream.rx_used)stream.rx_start=0;

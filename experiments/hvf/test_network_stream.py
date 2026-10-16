@@ -26,7 +26,10 @@ class StreamTests(unittest.TestCase):
                         # Invalid frame disconnects only the transport, never the VMM.
                         c.sendall(struct.pack('!I',0xffffffff))
                     finally:c.close()
-                    c,_=listener.accept();c.close()
+                    c,_=listener.accept()
+                    # The tiny guest never provisions RX buffers. Retain an
+                    # inbound frame and ensure pause still drains it.
+                    c.sendall(struct.pack('!I',14)+bytes(14))
                     deadline=time.monotonic()+5
                     while api(sock,'GET','/')[1]['state']!='Running':
                         self.assertLess(time.monotonic(),deadline);time.sleep(.01)
@@ -48,4 +51,4 @@ class StreamTests(unittest.TestCase):
                     self.assertTrue((work/'snapshot'/'manifest.json').is_file())
                     self.assertEqual(api(sock,'PUT','/actions',{'action_type':'Resume'})[0],202)
                 finally:
-                    p.terminate();p.wait(timeout=5);listener.close()
+                    p.terminate();p.wait(timeout=5);c.close();listener.close()

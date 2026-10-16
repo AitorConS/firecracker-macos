@@ -433,6 +433,7 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
         }
         if(phase==1)kick_cpus(); // Repeat: a CPU can enter hv_vcpu_run after an earlier kick.
         pthread_mutex_lock(&io_lock);
+        if(phase==1 && parked_cpus()==(int)ncpus)net_quiesce(1);
         int network_active=0;
         if(phase<3){devices_poll();network_active=net_poll();}else net_backend_health();
         int wake_fd=phase==0?net_wait_fd():-1;
@@ -444,6 +445,7 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
             phase=3;if(control_send(options->ready_fd,'P',transition))finish(143);
         }
         if(phase==4 && net_backend_pause_ready(transition)){
+            net_quiesce(0);
             uint64_t elapsed=mach_absolute_time()-paused_ticks;
             mach_timebase_info_data_t timebase;mach_timebase_info(&timebase);
             clock_offset_ns+=(uint64_t)((__uint128_t)elapsed*timebase.numer/timebase.denom);
@@ -481,13 +483,10 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
         if(phase==0 && network_active)network_hot_polls=20;
         else if(network_hot_polls)network_hot_polls--;
         unsigned sleep_us=phase==0 && network_hot_polls?100:1000;
-        // A switch that lets only a few KiB into the socket (older jerboad) would cap
-        // throughput at one buffer per interval: its link ends the sleep early instead.
-        // The descriptor may close meanwhile: select then returns early, which is harmless.
-        if(wake_fd>=0 && wake_fd<FD_SETSIZE){
-            fd_set readable;FD_ZERO(&readable);FD_SET(wake_fd,&readable);
-            struct timeval wait={0,(int)sleep_us};(void)select(wake_fd+1,&readable,NULL,NULL,&wait);
-        }else usleep(sleep_us);
+        // Supervisor commands and broker frames end the sleep early. A switch
+        // that lets only a few KiB into the socket (older jerboad) would cap
+        // throughput at one buffer per interval: its link (wake_fd) does too.
+        net_backend_wait(options->ready_fd,phase<3,wake_fd,sleep_us);
     }
     pthread_mutex_lock(&state_lock);pthread_cond_broadcast(&state_change);pthread_mutex_unlock(&state_lock);
     // Block workers raise interrupts: stop them while vCPUs and the GIC exist.

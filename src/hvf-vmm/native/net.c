@@ -19,7 +19,7 @@ static struct budget network_budget;
 #define ECAM 0x3f008000ULL
 #define QSZ 256
 #define VRING_AVAIL_F_NO_INTERRUPT 1u
-static int enabled;
+static int enabled,quiescing;
 static uint8_t *ram;
 static size_t ram_size;
 static uint8_t cfg[256],status,isr;
@@ -129,7 +129,13 @@ static ssize_t receive(const void *buf,size_t len,void *opaque){
     static const uint8_t plain[10];
     struct queue *q=&queues[0];
     if(!opaque&&switch_capabilities(buf,len))return (ssize_t)len;
-    if(!pending(q)){errno=EAGAIN;return -1;} // IPC retains one frame until the guest replenishes RX
+    // An empty ring is temporary backpressure: IPC retains the frame until the
+    // guest replenishes RX. Parked vCPUs cannot, so a pause drains the finite
+    // broker queue and accounts those frames as drops before a snapshot.
+    if(!pending(q)){
+        if(quiescing){drop_packets++;drop_bytes+=len;return (ssize_t)len;}
+        errno=EAGAIN;return -1;
+    }
     struct vnet_hdr hd={0};
     uint8_t described[VNET_HDR];
     if(!opaque&&switch_caps.mtu&&len>switch_caps.mtu+14u){
@@ -148,7 +154,10 @@ static ssize_t receive(const void *buf,size_t len,void *opaque){
     if(hd.gso_type&&!tso){
         // A guest without TSO receives the segments it would have seen on a wire.
         int count=vnet_gso_count(buf,len,&hd);
-        if(queued(q)<(unsigned)count){errno=EAGAIN;return -1;}
+        if(queued(q)<(unsigned)count){
+            if(quiescing){drop_packets++;drop_bytes+=len;return (ssize_t)len;}
+            errno=EAGAIN;return -1;
+        }
         if(!budget_take(&network_budget,len,(unsigned)count)){errno=EAGAIN;return -1;}
         for(int s=0;s<count;s++){
             long n=vnet_gso_segment(buf,len,&hd,(unsigned)s,staging,sizeof(staging));
@@ -206,14 +215,16 @@ static void transmit(void){
         // they refuse) uses the switch.
         int sent=tx_resume?-1:net_peer_send(frame,len);
         if(sent<0)sent=to_switch(frame+10,len-10,&hd);
-        if(!sent)break;
+        // Nothing left the device: the retry takes the budget again. A TSO
+        // frame cut short (tx_resume) keeps it for its remaining segments.
+        if(!sent){if(!tx_resume)budget_refund(&network_budget,len-10,1);break;}
         complete(q,h,0);tx++;tx_bytes+=len-10;
     }
 }
 int net_init(void *memory,size_t size,const struct hvf_options *options){
     budget_init(&network_budget,options->network_bytes_per_second,options->network_packets_per_second,256ULL<<10,256);
     memset(cfg,0,sizeof(cfg));memset(queues,0,sizeof(queues));
-    status=isr=features=selectq=rx=tx=0;bar=BAR;tx_resume=0;memset(&switch_caps,0,sizeof(switch_caps));
+    status=isr=features=selectq=rx=tx=0;quiescing=0;bar=BAR;tx_resume=0;memset(&switch_caps,0,sizeof(switch_caps));
     rx_bytes=tx_bytes=drop_packets=drop_bytes=0;
     ram=memory;ram_size=size;enabled=options->network_enabled;if(!enabled)return 0;
     memcpy(mac,options->mac,6);
@@ -235,7 +246,7 @@ int net_mmio(uint64_t addr,unsigned size,int write,uint64_t *v){
         case 4:if(size!=4||(*v&~NET_FEATURES))return 0;features=*v;break;
         case 8:if(size!=4||!q)return 0;*q=(struct queue){.pfn=*v};break;
         case 14:if(size!=2)return 0;selectq=*v;break;
-        case 16:if(size!=2||*v>1)return 0;if(*v==1)transmit();break;
+        case 16:if(size!=2||*v>1)return 0;if(*v==1)transmit();else net_backend_poll();break;
         case 18:if(size!=1)return 0;status=*v;if(!status){memset(queues,0,sizeof(queues));features=0;isr=0;tx_resume=0;irq(0);}break;
         default:return 0;
     }}else{switch(off){
@@ -251,6 +262,7 @@ int net_mmio(uint64_t addr,unsigned size,int write,uint64_t *v){
 }
 int net_pending_tx(void){return enabled && pending(&queues[1]);}
 int net_wait_fd(void){return enabled?net_backend_wait_fd():-1;}
+void net_quiesce(int value){quiescing=value;}
 int net_poll(void){
     if(!enabled)return 0;
     unsigned long before_tx=tx,before_rx=rx;

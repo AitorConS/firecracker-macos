@@ -42,6 +42,13 @@ int main(void){
     blocked=1;assert(write(peer,frame,18)==18);stream_poll();
     assert(received==3 && stream.used==18);stream_poll();assert(received==3);
     blocked=0;stream_poll();assert(received==4 && stream.used==0);
+    // An RX notification retries only the held frame and leaves later bytes
+    // in the socket for the device loop.
+    blocked=1;assert(write(peer,frame,18)==18);stream_poll();assert(received==4 && stream.used==18);
+    stream_retry_held();assert(received==4 && stream.used==18);
+    assert(write(peer,frame,18)==18);
+    blocked=0;stream_retry_held();assert(received==5 && stream.used==0 && stream.rx_used==0);
+    stream_poll();assert(received==6);
     for(unsigned i=0;i<300;i++)stream_send(frame+4,14);
     uint8_t data[8192];ssize_t n=read(peer,data,sizeof(data));assert(n>0 && n%18==0);
     for(ssize_t i=0;i<n;i+=18)assert(!memcmp(data+i,frame,18));

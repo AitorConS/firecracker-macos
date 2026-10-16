@@ -35,6 +35,7 @@ int net_backend_send(const void *data,size_t size){
     assert(data && size==14);sends++;return 1;
 }
 void net_backend_poll(void){}
+void net_backend_kick(void){}
 void net_backend_close(void){deliver=NULL;}
 void net_backend_health(void){}
 int net_backend_wait_fd(void){return -1;}

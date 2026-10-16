@@ -127,6 +127,15 @@ static int stream_offer(const void *data,size_t size) {
     stream.queued=size+4;stream.sent=(size_t)n;
     return 1;
 }
+// Delivers the complete frame held back by receive backpressure, if any,
+// without reading the socket.
+static void stream_retry_held(void) {
+    if(stream.fd<0 || stream.need<=4 || stream.used!=stream.need)return;
+    if(stream.receive(stream.rx+stream.rx_start+4,stream.need-4,NULL)<0)return;
+    stream.rx_start+=stream.need;stream.rx_used-=stream.need;
+    if(!stream.rx_used)stream.rx_start=0;
+    stream.need=4;stream.used=0;
+}
 static void stream_poll(void) {
     if(stream.paused)return;
     stream_connect();if(stream.fd<0)return;

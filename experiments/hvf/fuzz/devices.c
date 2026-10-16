@@ -30,6 +30,7 @@ int fuzz_log(FILE *stream,const char *format,...){(void)stream;(void)format;retu
 int net_backend_open(const struct hvf_options *o,net_receive_fn cb){(void)o;receive_packet=cb;return 0;}
 int net_backend_send(const void *p,size_t n){(void)p;(void)n;return 1;}
 void net_backend_poll(void){}
+void net_backend_kick(void){}
 void net_backend_close(void){receive_packet=NULL;}
 int net_backend_wait_fd(void){return -1;}
 // No direct peers: every frame takes the switch path.

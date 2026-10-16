@@ -246,7 +246,7 @@ int net_mmio(uint64_t addr,unsigned size,int write,uint64_t *v){
         case 4:if(size!=4||(*v&~NET_FEATURES))return 0;features=*v;break;
         case 8:if(size!=4||!q)return 0;*q=(struct queue){.pfn=*v};break;
         case 14:if(size!=2)return 0;selectq=*v;break;
-        case 16:if(size!=2||*v>1)return 0;if(*v==1)transmit();else net_backend_poll();break;
+        case 16:if(size!=2||*v>1)return 0;if(*v==1)transmit();else net_backend_kick();break;
         case 18:if(size!=1)return 0;status=*v;if(!status){memset(queues,0,sizeof(queues));features=0;isr=0;tx_resume=0;irq(0);}break;
         default:return 0;
     }}else{switch(off){

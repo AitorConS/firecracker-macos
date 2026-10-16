@@ -295,6 +295,13 @@ void net_backend_poll(void){
         if(receive_frame(packet,(size_t)n,NULL)<0){memcpy(deferred_frame,packet,(size_t)n);deferred_size=(size_t)n;break;}
     }
 }
+// RX queue notification from a vCPU: the guest has just posted buffers.
+// Deliver only the frame that waited for them; reading more frames stays with
+// the device loop, so a vCPU never drains sockets on the guest's time.
+void net_backend_kick(void){
+    if(link_generation&&!link_lost)stream_retry_held();
+    if(deferred_size&&receive_frame(deferred_frame,deferred_size,NULL)>=0)deferred_size=0;
+}
 void net_backend_close(void){
     deferred_size=0;
     if(link_channel>=0){close(link_channel);link_channel=-1;}

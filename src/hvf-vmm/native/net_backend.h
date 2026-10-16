@@ -26,5 +26,8 @@ void slirp_backend_close(void);
 
 void net_backend_metrics(uint64_t out[7]);
 
+// Retries the frame waiting for guest RX buffers (vCPU RX notification).
+void net_backend_kick(void);
+
 // Sleeps up to sleep_us, waking on supervisor, broker or wake_fd input.
 void net_backend_wait(int control_fd,int running,int wake_fd,unsigned sleep_us);

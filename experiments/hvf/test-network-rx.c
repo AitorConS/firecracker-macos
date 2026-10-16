@@ -13,6 +13,7 @@ static unsigned char memory[1<<20];
 int net_backend_open(const struct hvf_options *o,net_receive_fn fn){(void)o;deliver=fn;return 0;}
 int net_backend_send(const void *p,size_t n){(void)p;(void)n;return 1;}
 void net_backend_poll(void){polls++;}
+void net_backend_kick(void){polls++;}
 void net_backend_close(void){}
 int net_backend_wait_fd(void){return -1;}
 int net_peer_send(const uint8_t *frame,size_t len){(void)frame;(void)len;return -1;}

@@ -38,6 +38,7 @@ int net_backend_send(const void *data,size_t size){
     memcpy(sent[sends],data,size);sent_len[sends++]=size;return 1;
 }
 void net_backend_poll(void){}
+void net_backend_kick(void){}
 void net_backend_close(void){receive=NULL;}
 void net_backend_health(void){}
 int net_backend_wait_fd(void){return -1;}

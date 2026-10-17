@@ -4,6 +4,8 @@
 #include "net.h"
 #include "input.h"
 #include "net_backend.h"
+#include "net_peer.h"
+#include <pthread.h>
 #include <assert.h>
 #include <fcntl.h>
 #include <setjmp.h>
@@ -17,12 +19,28 @@ static jmp_buf rejected;
 static net_receive_fn receive_packet;
 static uint8_t ram[SIZE];
 static int disk=-1;
-_Noreturn void fuzz_exit(int status){if(status==2)longjmp(rejected,1);abort();}
+// A rejected input ends the run on the main thread. A block worker cannot
+// jump there: it gives up its device and exits (production exits the VMM).
+_Noreturn void fuzz_exit(int status){
+    if(status==2&&!pthread_main_np()){(void)pthread_mutex_unlock(&io_lock);pthread_exit(NULL);}
+    if(status==2)longjmp(rejected,1);
+    abort();
+}
 int fuzz_log(FILE *stream,const char *format,...){(void)stream;(void)format;return 0;}
 int net_backend_open(const struct hvf_options *o,net_receive_fn cb){(void)o;receive_packet=cb;return 0;}
 int net_backend_send(const void *p,size_t n){(void)p;(void)n;return 1;}
 void net_backend_poll(void){}
+void net_backend_kick(void){}
 void net_backend_close(void){receive_packet=NULL;}
+int net_backend_wait_fd(void){return -1;}
+// No direct peers: every frame takes the switch path.
+void net_peer_open(int channel,const uint8_t m[6],net_peer_receive_fn deliver){(void)channel;(void)m;(void)deliver;}
+int net_peer_send(const uint8_t *frame,size_t len){(void)frame;(void)len;return -1;}
+int net_peer_poll(void){return 0;}
+void net_peer_close(void){}
+// The supervisor holds the device lock around device calls, as here. Error
+// checking lets a failing block worker release it only if it holds it.
+pthread_mutex_t io_lock=PTHREAD_ERRORCHECK_MUTEX_INITIALIZER;
 static void put(size_t off,unsigned size,uint64_t value){memcpy(ram+off,&value,size);}
 static void desc(unsigned i,uint64_t addr,uint32_t len,uint16_t flags,uint16_t next){
     size_t off=0x10000+16*i;put(off,8,addr);put(off+8,4,len);put(off+12,2,flags);put(off+14,2,next);
@@ -41,6 +59,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data,size_t size){
     struct hvf_firmware fw={.name="opt/example/data",.data=payload,.len=4};
     struct hvf_options options={.drive_count=1,.drives=&drive,.firmware_count=1,.firmware=&fw,.network_enabled=1};
     assert(devices_init(ram,SIZE,NULL,&options)==0);assert(net_init(ram,SIZE,&options)==0);input_init(ram,SIZE,1);
+    pthread_mutex_lock(&io_lock);
     if(!setjmp(rejected)){
         unsigned target=data[0]%5;
         if(target==4){
@@ -61,7 +80,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data,size_t size){
         }
         if(target==0){wr(0,18,1,7);wr(0,8,4,(BASE+0x10000)>>12);wr(0,16,2,0);devices_poll();}
         if(target==1){wr(1,18,1,7);wr(1,14,2,(data[1]&2)?0:1);wr(1,8,4,(BASE+0x10000)>>12);
-            if(data[1]&2)receive_packet(payload,sizeof(payload),NULL);else net_poll();}
+            // Switch frames: a fixed one, or the input itself (capabilities, whole TSO frames).
+            if(data[1]&2){if((data[1]&4)&&size>=16)receive_packet(data+2,size-2<65526?size-2:65526,NULL);else receive_packet(payload,sizeof(payload),NULL);}
+            else net_poll();}
         if(target==2){wr(2,0x24,4,1);wr(2,0x20,4,1);wr(2,0x38,4,64);wr(2,0x80,4,BASE+0x10000);wr(2,0x90,4,BASE+0x11000);wr(2,0xa0,4,BASE+0x12000);wr(2,0x44,4,1);wr(2,0x70,4,15);input_power_button();}
         // Arbitrary PCI ECAM, BAR, firmware and MMIO accesses, with architectural widths.
         static const uint64_t bases[]={0x3f000000,0x3f008000,0x10000000,0x10010000,0x09020000,0x09030000};
@@ -71,5 +92,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data,size_t size){
             devices_mmio(addr,width,write,&value);net_mmio(addr,width,write,&value);input_mmio(addr,width,write,&value);
         }
     }
+    pthread_mutex_unlock(&io_lock);
     devices_close();net_close();return 0;
 }

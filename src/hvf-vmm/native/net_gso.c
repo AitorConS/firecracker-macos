@@ -52,6 +52,23 @@ int vnet_gso_count(const uint8_t *f,size_t len,const struct vnet_hdr *h){
     size_t count=(payload+h->gso_size-1)/h->gso_size;
     return count>GSO_MAX_SEGMENTS?-1:(int)count;
 }
+int vnet_gso_whole(uint8_t *f,size_t len,const struct vnet_hdr *h){
+    size_t headers,payload;
+    if(tcp4(f,len,h,&headers,&payload)||len-ETH>65535)return -1;
+    uint8_t *ip=f+ETH;size_t ihl=(size_t)(ip[0]&15)*4;
+    put_be16(ip+2,(uint16_t)(len-ETH));
+    put_be16(ip+10,0);put_be16(ip+10,(uint16_t)~fold(sum16(0,ip,ihl)));
+    return 0;
+}
+int vnet_gso_describe(const uint8_t *f,size_t len,unsigned mtu,struct vnet_hdr *h){
+    struct vnet_hdr probe={.gso_type=VNET_GSO_TCPV4,.gso_size=1};
+    size_t headers,payload;
+    if(tcp4(f,len,&probe,&headers,&payload)||be16(f+ETH+2)!=len-ETH||headers-ETH>=mtu)return -1;
+    size_t ihl=(size_t)(f[ETH]&15)*4;
+    *h=(struct vnet_hdr){.flags=VNET_F_NEEDS_CSUM,.gso_type=VNET_GSO_TCPV4,.hdr_len=(uint16_t)headers,
+        .gso_size=(uint16_t)(mtu-(headers-ETH)),.csum_start=(uint16_t)(ETH+ihl),.csum_offset=16};
+    return 0;
+}
 long vnet_gso_segment(const uint8_t *f,size_t len,const struct vnet_hdr *h,unsigned index,uint8_t *out,size_t cap){
     size_t headers,payload;
     if(tcp4(f,len,h,&headers,&payload))return -1;

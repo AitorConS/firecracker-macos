@@ -8,6 +8,7 @@
 #include "policy.h"
 #include "socket_gate.h"
 #include <poll.h>
+#include <sys/select.h>
 #include <sys/ioctl.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -16,6 +17,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #include "net_backend_stream.h"
 #include "net_peer.h"
@@ -23,9 +25,9 @@
 
 static int frames=-1,health=-1,stats=-1,peer_channel=-1,link_channel=-1;
 static uint64_t stream_drops,stream_drop_bytes;
-static uint64_t tx_drops,tx_drop_bytes,rx_drops,rx_drop_bytes,stats_drops;
+static uint64_t rx_drops,rx_drop_bytes,stats_drops;
 static uint8_t deferred_frame[65536];
-static size_t deferred_size;
+static _Atomic size_t deferred_size;
 static pid_t broker=-1;
 static struct control_reader health_reader;
 static uint64_t pause_operation, pause_ack;
@@ -94,6 +96,10 @@ static ssize_t broker_deliver(const void *data,size_t size,void *opaque){
     }
     return n;
 }
+static ssize_t stream_deliver(const void *data,size_t size,void *opaque){
+    (void)opaque;
+    return send(frames,data,size,MSG_DONTWAIT);
+}
 static void broker_main(const struct hvf_options *options){
     if(net_forget_guest_memory())_exit(2);
     if(options->cpu_seconds){struct rlimit limit={options->cpu_seconds,options->cpu_seconds};if(setrlimit(RLIMIT_CPU,&limit))_exit(2); }
@@ -113,7 +119,7 @@ static void broker_main(const struct hvf_options *options){
        ((!is_stream && hvf_gate_start()) || hvf_sandbox_install(options->security->broker_profile))){
         (void)control_send(health,'E',0);_exit(2);
     }
-    if(is_stream?stream_open(options,broker_deliver):slirp_backend_open(options,broker_deliver)){
+    if(is_stream?stream_open(options,stream_deliver):slirp_backend_open(options,broker_deliver)){
         (void)control_send(health,'E',0);_exit(2);
     }
     if(is_stream&&options->control_path&&peer_channel>=0)relay_open(options->control_path,peer_channel,options->mac);
@@ -134,12 +140,17 @@ static void broker_main(const struct hvf_options *options){
         if(!is_stream && hvf_gate_check()){fprintf(stderr,"socket authority disconnected\n");_exit(2);}
         // Wake for Unix-stream traffic directly. Polling only the supervisor
         // sockets added a fixed 1 ms delay to every guest/host exchange.
+        // While the guest refuses a frame (blocked_rx), stop reading the stream
+        // and wait for room in the IPC socket instead.
+        int blocked_rx=is_stream && stream.used==stream.need && stream.need>4;
         short stream_events=0;
-        if(is_stream && stream.fd>=0){
-            if(stream.used<stream.need)stream_events|=POLLIN;
-            if(stream.queued)stream_events|=POLLOUT;
+        if(is_stream && stream.fd>=0 && !paused){
+            if(!blocked_rx)stream_events|=POLLIN;
+            if(stream.connecting || stream.queued)stream_events|=POLLOUT;
         }
-        struct pollfd fds[6]={{health,POLLIN,0},{frames,POLLIN,0},{stream.fd,stream_events,0}};
+        short ipc_events=(!is_stream || direct || stream_can_send())?POLLIN:0;
+        if(blocked_rx)ipc_events|=POLLOUT;
+        struct pollfd fds[6]={{health,POLLIN,0},{frames,ipc_events,0},{stream.fd,stream_events,0}};
         unsigned nfds=is_stream && stream.fd>=0?3:2;
         if(link_channel>=0)fds[nfds++]=(struct pollfd){link_channel,POLLIN,0};
         nfds+=relay_poll_fds(fds+nfds);
@@ -182,13 +193,13 @@ static void broker_main(const struct hvf_options *options){
             if(!direct&&stream.fd>=0&&!stream.connecting&&!stream.queued&&!stream.rx_used&&
                !link_message(link_channel,LINK_OFFER,offered+1,stream.fd)){
                 offered++;direct=1;held=stream.fd;
-                stream.fd=-1;stream.used=0;stream.need=4;stream.rx_start=stream.rx_used=0;stream.queued=stream.sent=0;
+                stream.fd=-1;stream.used=0;stream.need=4;stream.rx_start=stream.rx_used=0;stream.queued=stream.sent=stream.tx_head=0;
             }
         }
         if(paused){usleep(1000);continue;}
         for(unsigned budget=0;budget<256;budget++){
             // While the VMM owns the link it sends nothing here; drain stragglers.
-            if(is_stream&&!direct){stream_flush();if(stream.queued)break;}
+            if(is_stream && !direct && !stream_can_send())break;
             ssize_t n=recv(frames,packet,sizeof(packet),MSG_DONTWAIT);
             if(n<0){if(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)goto done;break;}
             if(n<14||n>65536)goto done;
@@ -258,7 +269,7 @@ static void link_service(void){
         if(stream.fd>=0)close(stream.fd);
         int paused=stream.paused;
         stream.fd=descriptor;stream.connecting=0;stream.used=0;stream.need=4;stream.rx_start=stream.rx_used=0;
-        stream.queued=stream.sent=0;stream.progress=stream.tx_progress=stream_ms();stream.paused=paused;
+        stream.queued=stream.sent=stream.tx_head=0;stream.progress=stream.tx_progress=stream_ms();stream.paused=paused;
         if(!link_generation)fprintf(stderr,"network: direct link to the switch\n");
         link_generation=generation;link_lost=0;link_partial_polls=0;
         if(link_message(link_channel,LINK_ACK,generation,-1))fail("link acknowledgement");
@@ -283,6 +294,13 @@ void net_backend_poll(void){
         if(n<14||n>65536)fail("invalid broker frame");
         if(receive_frame(packet,(size_t)n,NULL)<0){memcpy(deferred_frame,packet,(size_t)n);deferred_size=(size_t)n;break;}
     }
+}
+// RX queue notification from a vCPU: the guest has just posted buffers.
+// Deliver only the frame that waited for them; reading more frames stays with
+// the device loop, so a vCPU never drains sockets on the guest's time.
+void net_backend_kick(void){
+    if(link_generation&&!link_lost)stream_retry_held();
+    if(deferred_size&&receive_frame(deferred_frame,deferred_size,NULL)>=0)deferred_size=0;
 }
 void net_backend_close(void){
     deferred_size=0;
@@ -340,5 +358,19 @@ void net_backend_metrics(uint64_t out[7]){
         rx_drops=values[0];rx_drop_bytes=values[1];stats_drops=values[2];stream_drops=values[3];stream_drop_bytes=values[4];
     }
     int next=0;if(frames>=0 && ioctl(frames,FIONREAD,&next))next=-1;
-    out[0]=next>=0?(uint64_t)next:UINT64_MAX;out[1]=deferred_size;out[2]=tx_drops+stream_drops+(broker>0?stream.drops:0);out[3]=tx_drop_bytes+stream_drop_bytes+(broker>0?stream.drop_bytes:0);out[4]=rx_drops;out[5]=rx_drop_bytes;out[6]=stats_drops;
+    out[0]=next>=0?(uint64_t)next:UINT64_MAX;out[1]=deferred_size;out[2]=stream_drops+(broker>0?stream.drops:0);out[3]=stream_drop_bytes+(broker>0?stream.drop_bytes:0);out[4]=rx_drops;out[5]=rx_drop_bytes;out[6]=stats_drops;
+}
+
+// Called outside the device lock between device-loop iterations. Sleeps for
+// sleep_us at most, waking early when the supervisor or the broker has input,
+// and on wake_fd (the direct link, when it asks for that; see net_wait_fd).
+// Only the deferred length is shared with the vCPU RX-kick path: while a frame
+// waits for guest buffers, readable IPC input must not end every sleep.
+void net_backend_wait(int control_fd,int running,int wake_fd,unsigned sleep_us){
+    int fds[4]={control_fd,health,running && !atomic_load(&deferred_size)?frames:-1,running?wake_fd:-1};
+    fd_set readable;FD_ZERO(&readable);int top=-1;
+    for(unsigned i=0;i<4;i++)if(fds[i]>=0 && fds[i]<FD_SETSIZE){FD_SET(fds[i],&readable);if(fds[i]>top)top=fds[i];}
+    if(top<0){usleep(sleep_us);return;}
+    struct timeval wait={0,(int)sleep_us};
+    (void)select(top+1,&readable,NULL,NULL,&wait);
 }

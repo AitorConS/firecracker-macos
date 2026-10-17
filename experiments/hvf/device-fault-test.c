@@ -15,11 +15,13 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <sys/uio.h>
+#include <pthread.h>
+pthread_mutex_t io_lock=PTHREAD_MUTEX_INITIALIZER;
 static const char *fault_case;
 static uint8_t *fixture;
 static unsigned read_calls,write_calls,flush_calls,fsync_calls;
 static int short_io;
-static int write_errno[16],flush_errno[16];
+static int write_errno[16],flush_errno[16],fsync_errno;
 static char trace[64];
 static unsigned trace_len;
 static uint16_t used_at_flush=0xffff;
@@ -32,8 +34,16 @@ static const uint8_t *flush_status;
 struct wire_desc{uint64_t addr;uint32_t len;uint16_t flags,next;};
 static int is(const char *name){return !strcmp(fault_case,name);}
 static void note(char c){if(trace_len+1<sizeof(trace))trace[trace_len++]=c;}
+static pthread_mutex_t inject_lock=PTHREAD_MUTEX_INITIALIZER;
+static unsigned stress_seed;
+static unsigned stress_rand(void){
+    pthread_mutex_lock(&inject_lock);
+    stress_seed=stress_seed*1103515245u+12345u;unsigned r=stress_seed>>8;
+    pthread_mutex_unlock(&inject_lock);return r;
+}
 static ssize_t injected_readv(int fd,const struct iovec *iov,int count,off_t offset){
-    read_calls++;note('R');
+    pthread_mutex_lock(&inject_lock);read_calls++;note('R');pthread_mutex_unlock(&inject_lock);
+    if(is("stress"))usleep(stress_rand()%2000);
     if(is("eof"))return 0;
     if(is("descriptor-edit") && read_calls==1){
         struct wire_desc *descriptors=(void *)(fixture+DESC);
@@ -46,20 +56,32 @@ static ssize_t injected_readv(int fd,const struct iovec *iov,int count,off_t off
     return preadv(fd,iov,count,offset);
 }
 static ssize_t injected_writev(int fd,const struct iovec *iov,int count,off_t offset){
-    write_calls++;note('W');
-    if(write_calls<16 && write_errno[write_calls]){errno=write_errno[write_calls];return -1;}
+    pthread_mutex_lock(&inject_lock);
+    unsigned call=++write_calls;note('W');
+    pthread_mutex_unlock(&inject_lock);
+    // Slow the first write so that an unordered FLUSH or overlapping write would overtake it.
+    if(is("stress"))usleep(stress_rand()%2000);
+    // (keyed on the data of the first request, 0x11, whichever worker issues it)
+    if((is("ordering")||is("overlap")) && iov[0].iov_len && *(uint8_t *)iov[0].iov_base==0x11)usleep(50000);
+    if(call<16 && write_errno[call]){errno=write_errno[call];return -1;}
     if(short_io){struct iovec first=*iov;if(first.iov_len>7)first.iov_len=7;return pwritev(fd,&first,1,offset);}
     return pwritev(fd,iov,count,offset);
 }
 static int injected_fullsync(int fd,int command,...){
-    assert(command==F_FULLFSYNC);flush_calls++;note('F');
+    assert(command==F_FULLFSYNC);
+    pthread_mutex_lock(&inject_lock);flush_calls++;note('F');pthread_mutex_unlock(&inject_lock);
     memcpy(&used_at_flush,fixture+USED+2,2);
     if(flush_status)status_at_flush=*flush_status;
     if(flush_calls<16 && flush_errno[flush_calls]){errno=flush_errno[flush_calls];return -1;}
     return fcntl(fd,F_FULLFSYNC);
 }
-// Counts any weaker fallback; production code must never call fsync().
-static int injected_fsync(int fd){fsync_calls++;note('S');return fsync(fd);}
+// Counts fsync(): FLUSH must never be answered by it (no weaker fallback); it
+// is only issued by host writeback pacing, every PACE_BYTES of writes.
+static int injected_fsync(int fd){
+    pthread_mutex_lock(&inject_lock);fsync_calls++;note('S');pthread_mutex_unlock(&inject_lock);
+    if(fsync_errno){errno=fsync_errno;return -1;}
+    return fsync(fd);
+}
 #define preadv injected_readv
 #define pwritev injected_writev
 #define fcntl injected_fullsync
@@ -73,7 +95,9 @@ static int injected_fsync(int fd){fsync_calls++;note('S');return fsync(fd);}
 #undef fcntl
 #undef fsync
 static unsigned submitted;
-static void write_reg(uint64_t offset,unsigned size,uint64_t value){assert(devices_mmio(BAR+offset,size,1,&value));}
+static void write_reg(uint64_t offset,unsigned size,uint64_t value){
+    pthread_mutex_lock(&io_lock);assert(devices_mmio(BAR+offset,size,1,&value));pthread_mutex_unlock(&io_lock);
+}
 // Queue one request: 0 read, 1 write, 4 flush. Data is one 512-byte sector.
 static unsigned submit(uint32_t type,uint64_t sector,uint8_t fill){
     unsigned k=submitted++;assert(k<32);
@@ -101,9 +125,14 @@ static void split_data(unsigned k,uint32_t second_len){
     d[first].len=256;d[first].next=extra;
     d[extra]=(struct wire_desc){d[first].addr+256,second_len,d[first].flags,3*k+2};
 }
-static void kick(void){write_reg(16,2,0);}
+static uint16_t used_idx(void){uint16_t v;pthread_mutex_lock(&io_lock);memcpy(&v,fixture+USED+2,2);pthread_mutex_unlock(&io_lock);return v;}
+// Requests complete on worker threads: wait until every submitted one is published.
+static void kick(void){
+    write_reg(16,2,0);
+    for(int i=0;i<5000 && used_idx()!=(uint16_t)submitted;i++)usleep(1000);
+    assert(used_idx()==(uint16_t)submitted);
+}
 static uint8_t status(unsigned k){return fixture[STATUS+k];}
-static uint16_t used_idx(void){uint16_t v;memcpy(&v,fixture+USED+2,2);return v;}
 static uint32_t used_id(unsigned i){uint32_t v;memcpy(&v,fixture+USED+4+8*i,4);return v;}
 static uint8_t *data(unsigned k){return fixture+0x30000+0x1000*k;}
 static void expect_sector(int fd,uint64_t sector,uint8_t fill){
@@ -133,7 +162,7 @@ int main(int argc,char **argv){
         }
         fixture[STATUS]=0xff;
         d[QSZ-1]=(struct wire_desc){BASE+STATUS,1,2,0};
-        uint16_t idx=1;memcpy(fixture+AVAIL+2,&idx,2);kick();
+        uint16_t idx=1;memcpy(fixture+AVAIL+2,&idx,2);submitted=1;kick();
         assert(status(0)==0 && used_idx()==1 && write_calls==1);
         for(unsigned j=0;j<segments;j++)expect_sector(fd,j,j%251);
         devices_metrics(c);assert(c[2]==segments*512 && c[3]==0);
@@ -190,12 +219,42 @@ int main(int argc,char **argv){
     }else if(is("ordering")){
         submit(1,0,0x11);submit(1,1,0x22);unsigned f=submit(4,0,0);submit(1,2,0x33);
         flush_status=fixture+STATUS+f;kick();
-        // Earlier writes reach the host before F_FULLFSYNC; the FLUSH result is
-        // published only after it returns; later writes follow in order.
+        // Earlier writes complete before F_FULLFSYNC (the first one is slowed down);
+        // the FLUSH result is published only after it returns; the later write
+        // starts only after the FLUSH. Earlier writes may complete in either order.
         assert(!strcmp(trace,"WWFW"));assert(used_at_flush==2 && status_at_flush==0xff);
-        for(unsigned k=0;k<4;k++){assert(status(k)==0);assert(used_id(k)==3*k);}
+        for(unsigned k=0;k<4;k++)assert(status(k)==0);
+        assert((used_id(0)==0 && used_id(1)==3)||(used_id(0)==3 && used_id(1)==0));
+        assert(used_id(2)==6 && used_id(3)==9);
         assert(used_idx()==4);
         expect_sector(fd,0,0x11);expect_sector(fd,1,0x22);expect_sector(fd,2,0x33);
+    }else if(is("overlap")){
+        // The first write to sector 4 is slowed down; the later one must still win.
+        submit(1,4,0x11);submit(1,4,0x22);submit(1,5,0x33);kick();
+        for(unsigned k=0;k<3;k++)assert(status(k)==0);
+        expect_sector(fd,4,0x22);expect_sector(fd,5,0x33);
+    }else if(is("stress")){
+        // Random reads, writes and flushes over 4 sectors, completed by workers
+        // in any order: every read must return the last write taken before it,
+        // and the disk must end as the requests applied in ring order.
+        const char *e=getenv("STRESS_SEED");stress_seed=e?(unsigned)atoi(e):1;
+        unsigned seed=stress_seed;
+        uint8_t model[4];for(unsigned s2=0;s2<4;s2++)model[s2]=s2==0?0:0; // sector 0 holds the pattern
+        uint8_t expect_read[32];int is_read[32]={0};unsigned nreq=30;
+        unsigned r=seed;
+        for(unsigned k=0;k<nreq;k++){
+            r=r*1103515245u+12345u;unsigned kind=(r>>16)%10;
+            r=r*1103515245u+12345u;unsigned sec=1+(r>>16)%4;   // sectors 1..4 (sector 0 holds the pattern)
+            if(kind<5){uint8_t fill=(uint8_t)(1+k);submit(1,sec,fill);model[sec-1]=fill;}
+            else if(kind<9){submit(0,sec,0);is_read[k]=1;expect_read[k]=model[sec-1];}
+            else submit(4,0,0);
+        }
+        kick();
+        for(unsigned k=0;k<nreq;k++){
+            assert(status(k)==0);
+            if(is_read[k])for(unsigned i=0;i<512;i++)assert(data(k)[i]==expect_read[k]);
+        }
+        for(unsigned s2=0;s2<4;s2++)expect_sector(fd,1+s2,model[s2]);
     }else if(is("flush-readonly")){
         submit(4,0,0);submit(1,0,0x77);kick();
         assert(status(0)==0 && status(1)==1 && flush_calls==0 && write_calls==0);
@@ -213,6 +272,20 @@ int main(int argc,char **argv){
     }else if(is("close-latched")){
         write_errno[1]=EIO;submit(1,3,0x44);kick();assert(status(0)==1);
         devices_close();closed=1;assert(flush_calls==0 && fsync_calls==0);
+    }else if(is("pace")){
+        // Built with PACE_BYTES=1024: the second 512-byte write paces host
+        // writeback with fsync(); FLUSH still issues F_FULLFSYNC.
+        assert(PACE_BYTES==1024);
+        submit(1,0,0x61);kick();assert(status(0)==0 && fsync_calls==0);
+        submit(1,1,0x62);kick();assert(status(1)==0 && fsync_calls==1 && flush_calls==0);
+        submit(4,0,0);kick();assert(status(2)==0 && flush_calls==1 && fsync_calls==1);
+        expect_sector(fd,0,0x61);expect_sector(fd,1,0x62);
+    }else if(is("pace-error")){
+        // A failed pacing fsync() is a host storage error: later FLUSHes fail.
+        assert(PACE_BYTES==1024);
+        fsync_errno=EIO;submit(1,0,0x61);submit(1,1,0x62);kick();
+        assert(status(0)==0 && status(1)==0 && fsync_calls==1);
+        submit(4,0,0);kick();assert(status(2)==1 && flush_calls==0);
     }else{
         fprintf(stderr,"unknown case %s\n",fault_case);return 2;
     }

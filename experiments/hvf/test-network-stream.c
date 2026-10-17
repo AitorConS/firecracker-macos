@@ -38,6 +38,17 @@ int main(void){
     int peer=pair();uint8_t frame[18]={0,0,0,14,42};
     for(unsigned i=0;i<18;i++){assert(write(peer,frame+i,1)==1);stream_poll();assert(received==(i==17));}
     assert(write(peer,frame,18)==18);assert(write(peer,frame,18)==18);stream_poll();assert(received==3);
+    assert(stream_can_send());
+    blocked=1;assert(write(peer,frame,18)==18);stream_poll();
+    assert(received==3 && stream.used==18);stream_poll();assert(received==3);
+    blocked=0;stream_poll();assert(received==4 && stream.used==0);
+    // An RX notification retries only the held frame and leaves later bytes
+    // in the socket for the device loop.
+    blocked=1;assert(write(peer,frame,18)==18);stream_poll();assert(received==4 && stream.used==18);
+    stream_retry_held();assert(received==4 && stream.used==18);
+    assert(write(peer,frame,18)==18);
+    blocked=0;stream_retry_held();assert(received==5 && stream.used==0 && stream.rx_used==0);
+    stream_poll();assert(received==6);
     for(unsigned i=0;i<300;i++)stream_send(frame+4,14);
     uint8_t data[8192];ssize_t n=read(peer,data,sizeof(data));assert(n>0 && n%18==0);
     for(ssize_t i=0;i<n;i+=18)assert(!memcmp(data+i,frame,18));
@@ -99,20 +110,64 @@ int main(void){
     peer=pair();assert(write(peer,frame,2)==2);stream_poll();assert(stream.used==2);close(peer);stream_poll();assert(stream.used==0);
     // EOF after a complete header but before the declared payload is complete.
     peer=pair();assert(write(peer,frame,10)==10);stream_poll();assert(stream.used==10 && stream.need==18);close(peer);stream_poll();assert(stream.used==0 && stream.rx_used==0);
-    // Force partial writes and a full queue; the next frame must be dropped
-    // whole while the outstanding length-prefixed frame remains intact.
+    // A blocked peer retains multiple frames up to the byte limit. Saturation
+    // drops whole arrivals without corrupting a partially transmitted frame.
     peer=pair();int buffer=1024;assert(!setsockopt(stream.fd,SOL_SOCKET,SO_SNDBUF,&buffer,sizeof(buffer)));
     assert(!fcntl(peer,F_SETFL,O_NONBLOCK));large=calloc(1,STREAM_FRAME);assert(large);large[0]=42;
-    stream_send(large,STREAM_FRAME);assert(stream.queued>0);uint64_t drops=stream.drops;
-    stream_send(frame+4,14);assert(stream.drops==drops+1);
-    uint8_t *wire=malloc(STREAM_FRAME+4);assert(wire);size_t total=0;
-    for(unsigned budget=0;total<STREAM_FRAME+4 && budget<100000;budget++){
-        n=read(peer,wire+total,STREAM_FRAME+4-total);if(n>0)total+=(size_t)n;
+    uint64_t drops=stream.drops;
+    stream_send(large,STREAM_FRAME);assert(stream.queued>0);
+    stream_send(frame+4,14);assert(stream.drops==drops);
+    unsigned large_count=1;
+    while(stream.drops==drops){
+        stream_send(large,STREAM_FRAME);
+        if(stream.drops==drops)large_count++;
+        assert(stream.queued<=STREAM_TX_CAPACITY);
+    }
+    assert(large_count>1 && !stream_can_send());
+    size_t expected=(size_t)large_count*(STREAM_FRAME+4)+18;
+    uint8_t *wire=malloc(expected+2*(STREAM_FRAME+4));assert(wire);size_t total=0;
+    for(unsigned budget=0;total<3*(STREAM_FRAME+4) && budget<100000;budget++){
+        n=read(peer,wire+total,expected-total);
+        if(n>0)total+=(size_t)n;else assert(errno==EAGAIN||errno==EWOULDBLOCK);
+        stream_flush();
+    }
+    assert(stream.tx_head>0);
+    drops=stream.drops;
+    stream_send(large,STREAM_FRAME);stream_send(large,STREAM_FRAME);
+    assert(stream.drops==drops);expected+=2*(STREAM_FRAME+4);
+    for(unsigned budget=0;total<expected && budget<100000;budget++){
+        n=read(peer,wire+total,expected-total);if(n>0)total+=(size_t)n;
         else assert(errno==EAGAIN||errno==EWOULDBLOCK);
         stream_flush();
     }
-    assert(total==STREAM_FRAME+4);assert(wire[0]==0&&wire[1]==1&&wire[2]==0&&wire[3]==0);assert(!memcmp(wire+4,large,STREAM_FRAME));
+    assert(total==expected && stream.queued==0);
+    for(size_t offset=0;offset<total;){
+        uint32_t size=0;for(unsigned i=0;i<4;i++)size=(size<<8)|wire[offset+i];
+        assert(size==(offset==STREAM_FRAME+4?14:STREAM_FRAME));
+        assert(!memcmp(wire+offset+4,size==14?frame+4:large,size));offset+=size+4;
+    }
     free(wire);free(large);close(peer);stream_disconnect();
+    // A sender that owns the link (the VMM) never drops for a full socket:
+    // a partial write keeps the tail, a later frame is refused until the
+    // tail drains, and the byte stream carries every frame whole and in order.
+    peer=pair();buffer=1024;assert(!setsockopt(stream.fd,SOL_SOCKET,SO_SNDBUF,&buffer,sizeof(buffer)));
+    large=malloc(STREAM_FRAME);assert(large);for(unsigned i=0;i<STREAM_FRAME;i++)large[i]=(uint8_t)(i*13u+5u);
+    drops=stream.drops;assert(stream_offer(large,STREAM_FRAME)==1 && stream.queued==STREAM_FRAME+4 && stream.sent<stream.queued);
+    assert(stream_offer(frame+4,14)==0 && stream.drops==drops);
+    wire=malloc(2*(STREAM_FRAME+4));assert(wire);total=0;int second=0;
+    for(unsigned budget=0;budget<100000 && total<STREAM_FRAME+4+18;budget++){
+        n=read(peer,wire+total,2*(STREAM_FRAME+4)-total);if(n>0)total+=(size_t)n;
+        else assert(errno==EAGAIN||errno==EWOULDBLOCK);
+        if(!second)second=stream_offer(frame+4,14);else stream_flush();
+    }
+    assert(second && total==STREAM_FRAME+4+18 && stream.drops==drops);
+    assert(wire[0]==0&&wire[1]==1&&wire[2]==0&&wire[3]==0&&!memcmp(wire+4,large,STREAM_FRAME));
+    assert(!memcmp(wire+STREAM_FRAME+4,frame,18));
+    // Without a link the frame is counted as dropped, never retried forever.
+    close(peer);stream_disconnect();drops=stream.drops;assert(stream_offer(frame+4,14)==1 && stream.drops==drops+1);
+    // An adopted link has no path: losing it never makes this side connect.
+    stream.path=NULL;stream.retry=0;stream_connect();assert(stream.fd==-1);
+    free(wire);free(large);
     peer=pair();assert(write(peer,frame,1)==1);stream_poll();stream.progress=stream_ms()-5001;stream_poll();assert(stream.fd==-1);close(peer);
     char dir[]="/tmp/hvf-stream-XXXXXX";assert(mkdtemp(dir));char path[104];snprintf(path,sizeof(path),"%s/net",dir);
     int listener=socket(AF_UNIX,SOCK_STREAM,0);assert(listener>=0);struct sockaddr_un addr={.sun_family=AF_UNIX};strlcpy(addr.sun_path,path,sizeof(addr.sun_path));
@@ -122,5 +177,5 @@ int main(void){
     before=received;assert(write(peer,frame,18)==18);stream_poll();assert(received==before+1);close(peer);stream_poll();assert(stream.fd==-1);
     stream.retry=0;stream_connect();assert(stream.fd>=0);peer=accept(listener,NULL,NULL);assert(peer>=0);
     close(peer);close(listener);stream_disconnect();unlink(path);rmdir(dir);
-    puts("PASS stream: read-ahead/budget continuation, callback backpressure, pause, malformed/EOF reset, max frame, TX framing, private sockets and reconnect");
+    puts("PASS stream: read-ahead/budget continuation, callback backpressure, pause, malformed/EOF reset, max frame, TX framing, owner TX backpressure, private sockets and reconnect");
 }

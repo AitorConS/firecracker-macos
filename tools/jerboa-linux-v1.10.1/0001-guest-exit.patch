@@ -1,0 +1,102 @@
+diff --git a/src/vmm/src/vstate/vcpu/mod.rs b/src/vmm/src/vstate/vcpu/mod.rs
+index cb63afa..1671c0f 100644
+--- a/src/vmm/src/vstate/vcpu/mod.rs
++++ b/src/vmm/src/vstate/vcpu/mod.rs
+@@ -58,6 +58,8 @@ pub enum VcpuError {
+     SignalVcpu(vmm_sys_util::errno::Error),
+     /// Unexpected kvm exit received: {0}
+     UnhandledKvmExit(String),
++    /// Guest requested exit with status {0}
++    GuestExit(u8),
+     /// Failed to run action on vcpu: {0}
+     VcpuResponse(KvmVcpuError),
+     /// Cannot spawn a new vCPU thread: {0}
+@@ -469,20 +471,24 @@ impl Vcpu {
+         // Vmm initiated teardown starts from `pub fn Vmm::stop()` (step 4).
+         // Once `vmm.shutdown_exit_code` becomes `Some(exit_code)`, it is the upper layer's
+         // responsibility to break main event loop and propagate the exit code value.
+-        // Signal Vmm of Vcpu exit.
++        // Publish status before the event: the VMM drains pending responses
++        // without waiting and otherwise could observe an empty channel as success.
++        self.response_sender
++            .send(VcpuResponse::Exited(exit_code))
++            .expect("vcpu channel unexpectedly closed");
+         if let Err(err) = self.exit_evt.write(1) {
+             METRICS.vcpu.failures.inc();
+             error!("Failed signaling vcpu exit event: {}", err);
+         }
+         // From this state we only accept going to finished.
+         loop {
+-            self.response_sender
+-                .send(VcpuResponse::Exited(exit_code))
+-                .expect("vcpu channel unexpectedly closed");
+             // Wait for and only accept 'VcpuEvent::Finish'.
+             if let Ok(VcpuEvent::Finish) = self.event_receiver.recv() {
+                 break;
+             }
++            self.response_sender
++                .send(VcpuResponse::Exited(exit_code))
++                .expect("vcpu channel unexpectedly closed");
+         }
+         StateMachine::finish()
+     }
+diff --git a/src/vmm/src/vstate/vcpu/x86_64.rs b/src/vmm/src/vstate/vcpu/x86_64.rs
+index 6fee393..7c1f518 100644
+--- a/src/vmm/src/vstate/vcpu/x86_64.rs
++++ b/src/vmm/src/vstate/vcpu/x86_64.rs
+@@ -640,6 +640,17 @@ impl Peripherals {
+                 Ok(VcpuEmulation::Handled)
+             }
+             VcpuExit::IoOut(addr, data) => {
++                // Jerboa writes a raw status byte before its fallback PS/2 reset.
++                // The QEMU process-exit encoding is not used on this I/O port.
++                if addr == 0x501 && data.len() == 1 {
++                    let code = data[0];
++                    if code == 0 {
++                        return Ok(VcpuEmulation::Stopped);
++                    }
++                    METRICS.vcpu.failures.inc();
++                    error!("Guest requested exit with code {code}");
++                    return Err(super::VcpuError::GuestExit(code));
++                }
+                 if let Some(pio_bus) = &self.pio_bus {
+                     let _metric = METRICS.vcpu.exit_io_out_agg.record_latency_metrics();
+                     pio_bus.write(u64::from(addr), data);
+@@ -730,6 +741,37 @@ mod tests {
+     use crate::vstate::vm::tests::setup_vm;
+     use crate::vstate::vm::Vm;
+ 
++    #[test]
++    fn test_guest_exit_port() {
++        let peripherals = Peripherals::default();
++        assert_eq!(
++            peripherals
++                .run_arch_emulation(VcpuExit::IoOut(0x501, &[0]))
++                .unwrap(),
++            VcpuEmulation::Stopped
++        );
++        for code in [1, 7, 255] {
++            assert!(matches!(
++                peripherals.run_arch_emulation(VcpuExit::IoOut(0x501, &[code])),
++                Err(crate::vstate::vcpu::VcpuError::GuestExit(value)) if value == code
++            ));
++        }
++        for data in [&[][..], &[0, 0][..], &[7, 0, 0, 0][..]] {
++            assert_eq!(
++                peripherals
++                    .run_arch_emulation(VcpuExit::IoOut(0x501, data))
++                    .unwrap(),
++                VcpuEmulation::Handled
++            );
++        }
++        assert_eq!(
++            peripherals
++                .run_arch_emulation(VcpuExit::IoOut(0x502, &[7]))
++                .unwrap(),
++            VcpuEmulation::Handled
++        );
++    }
++
+     impl Default for VcpuState {
+         fn default() -> Self {
+             VcpuState {

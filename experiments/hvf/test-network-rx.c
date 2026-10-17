@@ -6,13 +6,19 @@
 #include <string.h>
 #include "net_backend.h"
 #include "net.h"
+#include "net_peer.h"
 static net_receive_fn deliver;
 static unsigned polls;
 static unsigned char memory[1<<20];
 int net_backend_open(const struct hvf_options *o,net_receive_fn fn){(void)o;deliver=fn;return 0;}
 int net_backend_send(const void *p,size_t n){(void)p;(void)n;return 1;}
 void net_backend_poll(void){polls++;}
+void net_backend_kick(void){polls++;}
 void net_backend_close(void){}
+int net_backend_wait_fd(void){return -1;}
+int net_peer_send(const uint8_t *frame,size_t len){(void)frame;(void)len;return -1;}
+int net_peer_poll(void){return 0;}
+void net_peer_close(void){}
 static void put(unsigned off,unsigned size,uint64_t value){memcpy(memory+off,&value,size);}
 static void reg(unsigned off,unsigned size,uint64_t value){assert(net_mmio(0x10010000+off,size,1,&value));}
 int main(void){

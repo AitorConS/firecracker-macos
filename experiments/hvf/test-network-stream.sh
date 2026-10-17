@@ -13,5 +13,5 @@ echo "Stream test binaries: $output"
 
 xcrun clang -Wall -Wextra -Werror -fsanitize=address,undefined -g \
   -Iexperiments/hvf/fuzz/stubs -Isrc/hvf-vmm/native \
-  experiments/hvf/test-network-rx.c src/hvf-vmm/native/net.c -o "$output/receive"
+  experiments/hvf/test-network-rx.c src/hvf-vmm/native/net.c src/hvf-vmm/native/net_gso.c -o "$output/receive"
 "$output/receive"

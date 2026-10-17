@@ -19,6 +19,10 @@ nor is HEAD used as baseline of this shared checkout.
   previous version of that mechanism.
 - `test-network-{gate,fd,port}.py` retain the previous ICMP discriminants,
   TCP release and port collisions.
+- `sh experiments/hvf/test-net-irq.sh`: AddressSanitizer/UndefinedBehaviorSanitizer
+  test of native virtio-net queue completions. It checks Nanos-style polling TX
+  suppression, re-armed TX/RX wakeups, ISR acknowledgement, redundant GIC calls,
+  and pending-ISR snapshot restore without booting a guest.
 
 Use a fresh `--output` to preserve evidence. `--sanitize --fixed-only` is
 supported in transfer and recovery. Induced cases are distinguished from

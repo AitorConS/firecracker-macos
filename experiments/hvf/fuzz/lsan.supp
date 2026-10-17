@@ -1,0 +1,3 @@
+# A block worker that rejects a request exits its thread in the fuzzer (the
+# VMM process exits there), leaving its request buffer behind.
+leak:block_worker

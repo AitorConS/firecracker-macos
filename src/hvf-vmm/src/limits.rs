@@ -33,12 +33,21 @@ impl Default for Limits {
             open_files: 1024,
             file_size_bytes: 16 << 30,
             cpu_seconds: 86400,
-            rss_mib: 3072,
+            // HVF charges resident guest mappings in both host and hypervisor
+            // ledgers on macOS. A fully touched 2 GiB guest can report ~4 GiB
+            // RSS; retain another GiB for the VMM/broker and transient buffers.
+            // Explicit rss_mib values are still enforced without adjustment.
+            rss_mib: 5120,
             nice: 5,
-            disk_bytes_per_second: 256 << 20,
-            disk_operations_per_second: 20000,
-            network_bytes_per_second: 64 << 20,
-            network_packets_per_second: 100000,
+            // Device budgets should permit modern local storage by default;
+            // operators can still set lower explicit byte and IOPS limits.
+            disk_bytes_per_second: 8 << 30,
+            disk_operations_per_second: 250000,
+            // Network traffic is unrestricted unless the operator supplies a
+            // byte or packet rate. The former defaults throttled local VM
+            // links to 64 MiB/s, below even a single host's network capacity.
+            network_bytes_per_second: 0,
+            network_packets_per_second: 0,
         }
     }
 }
@@ -46,11 +55,13 @@ impl Limits {
     pub fn validate(&self) -> Result<()> {
         if !(1 << 20..=1 << 40).contains(&self.disk_bytes_per_second)
             || !(1..=1000000).contains(&self.disk_operations_per_second)
-            || !(1 << 20..=1 << 40).contains(&self.network_bytes_per_second)
-            || !(1..=1000000).contains(&self.network_packets_per_second)
+            || (self.network_bytes_per_second != 0
+                && !(1 << 20..=1 << 40).contains(&self.network_bytes_per_second))
+            || (self.network_packets_per_second != 0
+                && !(1..=1000000).contains(&self.network_packets_per_second))
         {
             return Err(
-                "I/O limits require 1 MiB/s..1 TiB/s and 1..1000000 operations or packets/s".into(),
+                "I/O limits require disk 1 MiB/s..1 TiB/s and 1..1000000 operations/s; network rates are 0 (unlimited), 1 MiB/s..1 TiB/s, or 1..1000000 packets/s".into(),
             );
         }
         if self.version != 1
@@ -208,5 +219,37 @@ mod tests {
         limits.open_files = 63;
         assert!(limits.validate().is_err());
         assert!(serde_json::from_str::<Limits>(r#"{"unexpected":1}"#).is_err());
+    }
+
+    #[test]
+    fn network_limits_are_optional_and_independent() {
+        let mut limits = Limits::default();
+        assert_eq!(limits.network_bytes_per_second, 0);
+        assert_eq!(limits.network_packets_per_second, 0);
+        limits.validate().unwrap();
+        limits.network_bytes_per_second = 1 << 20;
+        limits.validate().unwrap();
+        limits.network_bytes_per_second = 0;
+        limits.network_packets_per_second = 100;
+        limits.validate().unwrap();
+        limits.network_packets_per_second = 1000001;
+        assert!(limits.validate().is_err());
+    }
+
+    #[test]
+    fn default_rss_covers_maximum_guest_mappings() {
+        let limits = Limits::default();
+        assert_eq!(limits.rss_mib, 2 * 2048 + 1024);
+        let explicit: Limits = serde_json::from_str(r#"{"rss_mib":64}"#).unwrap();
+        explicit.validate().unwrap();
+        assert_eq!(Watchdog::new(&explicit).budget, 64 << 20);
+    }
+
+    #[test]
+    fn default_disk_budget_is_above_benchmark_scale() {
+        let limits = Limits::default();
+        assert_eq!(limits.disk_bytes_per_second, 8 << 30);
+        assert_eq!(limits.disk_operations_per_second, 250000);
+        limits.validate().unwrap();
     }
 }

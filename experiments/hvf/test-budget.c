@@ -10,11 +10,26 @@ int main(void){
     assert(!budget_take_at(&b,1,0,1)); // backwards time does not create credit
     assert(budget_take_at(&b,100,1,UINT64_MAX)); // overflow-safe refill, capped burst
     assert(!budget_take_at(&b,1,0,UINT64_MAX));
+    budget_init(&b,0,0,100,1);
+    assert(budget_take_at(&b,1000000,1000000,0)); // no configured cap
+    budget_init(&b,100,0,100,1);b.last=0;
+    assert(budget_take_at(&b,100,1000000,0)); // packet rate independently unlimited
+    assert(!budget_take_at(&b,1,1,0)); // byte rate still enforced
+    budget_init(&b,0,1,100,1);b.last=0;
+    assert(budget_take_at(&b,1000000,1,0)); // byte rate independently unlimited
+    assert(!budget_take_at(&b,1,1,0)); // packet rate still enforced
+    budget_init(&b,8ULL<<30,250000,4ULL<<20,32);b.last=0;
+    assert(b.byte_capacity>=((8ULL<<30)/1000));
+    assert(b.op_capacity>=250);
+    assert(budget_take_at(&b,b.byte_capacity,b.op_capacity,0));
+    assert(!budget_take_at(&b,1,1,0));
+    assert(budget_take_at(&b,b.byte_capacity-1,b.op_capacity,1000000));
+    // Refunds restore credit for retried work and never exceed capacity.
     for(unsigned i=0;i<1000;i++){
         budget_refund(&b,100,1);
         assert(budget_take_at(&b,100,1,UINT64_MAX));
     }
     budget_refund(&b,UINT64_MAX,UINT64_MAX);
     assert(b.bytes==b.byte_capacity && b.ops==b.op_capacity);
-    puts("I/O budget burst, fractional refill, backwards clock and overflow: PASS");
+    puts("I/O budget burst, fractional refill, backwards clock, overflow, refunds and independent unlimited dimensions: PASS");
 }

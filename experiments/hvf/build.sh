@@ -12,6 +12,7 @@ for source in "$slirp"/*.c; do
 done
 xcrun clang -arch arm64 -mmacosx-version-min=26.0 -Wall -Wextra -Werror -O2 \
     -DHVF_STANDALONE "$native/probe.c" "$native/devices.c" "$native/input.c" "$native/net.c" \
-    "$native/net_backend_slirp.c" "$native/net_backend_ipc.c" "$native/policy.c" "$native/socket_gate.c" "$native/sandbox.c" \
+    "$native/net_backend_slirp.c" "$native/net_backend_ipc.c" "$native/net_peer.c" "$native/net_gso.c" \
+    "$native/policy.c" "$native/socket_gate.c" "$native/sandbox.c" \
     -I"$slirp" build/slirp-objects/*.o -L"$glib/lib" -lglib-2.0 -lresolv -framework Hypervisor -o build/hvf-probe
 codesign --force --sign - --entitlements entitlements.plist build/hvf-probe

@@ -23,6 +23,7 @@ struct hvf_options {
     const struct hvf_security *security;
     const char *snapshot_dir;
     const char *stream_path;
+    const char *control_path; // peer control socket; requires stream_path
     uint32_t restore;
     uint64_t cpu_seconds;
     uint64_t disk_bytes_per_second,disk_operations_per_second,network_bytes_per_second,network_packets_per_second;

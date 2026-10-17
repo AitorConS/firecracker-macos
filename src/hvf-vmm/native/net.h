@@ -7,6 +7,7 @@ int net_init(void *ram,size_t size,const struct hvf_options *options);
 int net_mmio(uint64_t addr,unsigned size,int write,uint64_t *v);
 int net_poll(void); // true when this poll moved network frames
 int net_pending_tx(void);
+int net_wait_fd(void); // the switch link, while frames on it should wake the VMM; -1 otherwise
 void net_close(void);
 void net_metrics(uint64_t out[6]);
 
@@ -16,3 +17,6 @@ int net_forget_guest_memory(void);
 void net_snapshot(struct snapshot_io *s);
 
 void net_queue_depths(uint64_t out[2]);
+
+/* Device lock held; only set after all guest CPUs have parked. */
+void net_quiesce(int value);

@@ -24,5 +24,12 @@ int main(void){
     assert(budget_take_at(&b,b.byte_capacity,b.op_capacity,0));
     assert(!budget_take_at(&b,1,1,0));
     assert(budget_take_at(&b,b.byte_capacity-1,b.op_capacity,1000000));
-    puts("I/O budget burst, fractional refill, backwards clock, overflow and independent unlimited dimensions: PASS");
+    // Refunds restore credit for retried work and never exceed capacity.
+    for(unsigned i=0;i<1000;i++){
+        budget_refund(&b,100,1);
+        assert(budget_take_at(&b,100,1,UINT64_MAX));
+    }
+    budget_refund(&b,UINT64_MAX,UINT64_MAX);
+    assert(b.bytes==b.byte_capacity && b.ops==b.op_capacity);
+    puts("I/O budget burst, fractional refill, backwards clock, overflow, refunds and independent unlimited dimensions: PASS");
 }

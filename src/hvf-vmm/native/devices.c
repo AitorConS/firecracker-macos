@@ -440,7 +440,16 @@ int devices_pending(void){
     for(unsigned i=0;i<block_count;i++)if(blocks[i].inflight)return 1;
     return devices_queue_depth()!=0;
 }
-void devices_poll(void){for(unsigned i=0;i<block_count;i++)if(blocks[i].pfn && (blocks[i].status&4))notify(&blocks[i]);}
+// Polling covers guests that queue requests without a notification. Wake one
+// worker, and only when requests are waiting: a broadcast on every pass woke
+// all workers every 100 us to find nothing, and their trips through the
+// device lock stalled vCPU exits (20 % of a network-bound vCPU).
+void devices_poll(void){
+    for(unsigned i=0;i<block_count;i++){
+        struct block *b=&blocks[i];
+        if(b->pfn && (b->status&4) && !b->flushing && ring_ready(b))pthread_cond_signal(&b->wake);
+    }
+}
 int devices_exit_status(void){return guest_exit;}
 // Called without the device lock, while vCPUs and the GIC still exist: a
 // worker finishing a request raises its interrupt. Requests not yet taken

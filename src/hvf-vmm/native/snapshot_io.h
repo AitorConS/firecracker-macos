@@ -32,4 +32,57 @@ static inline int snapshot_end(struct snapshot_io *s){
     else if(fsync(s->fd))s->error=1;
     return s->error?-1:0;
 }
+// Guest RAM and disks are mostly zeros. Snapshot files leave zero pages as
+// holes (16 KiB is the host page size) and read back only their data extents.
+#define SNAPSHOT_PAGE 16384
+static inline int snapshot_zero(const uint8_t *p,size_t n){
+    const uint64_t *w=(const uint64_t *)(const void *)p;size_t words=n/8;
+    for(size_t i=0;i<words;i++)if(w[i])return 0;
+    for(size_t i=words*8;i<n;i++)if(p[i])return 0;
+    return 1;
+}
+// Writes the non-zero pages of data at offset base of fd, which the caller has
+// already extended to its full length. Runs are capped at 1 MiB per write.
+static inline int snapshot_write_sparse(int fd,const uint8_t *data,size_t size,off_t base){
+    size_t i=0;
+    while(i<size){
+        size_t n=size-i>SNAPSHOT_PAGE?SNAPSHOT_PAGE:size-i;
+        if(snapshot_zero(data+i,n)){i+=n;continue;}
+        size_t start=i;i+=n;
+        while(i<size&&i-start<(1u<<20)){
+            n=size-i>SNAPSHOT_PAGE?SNAPSHOT_PAGE:size-i;
+            if(snapshot_zero(data+i,n))break;
+            i+=n;
+        }
+        const uint8_t *p=data+start;size_t left=i-start;off_t at=base+(off_t)start;
+        while(left){
+            ssize_t w=pwrite(fd,p,left,at);
+            if(w<0&&errno==EINTR)continue;
+            if(w<=0)return -1;
+            p+=w;left-=(size_t)w;at+=w;
+        }
+    }
+    return 0;
+}
+// Calls visit(offset,length,ctx) for each data extent of the first size bytes
+// of fd; holes are skipped. Without hole information the whole range is data.
+static inline int snapshot_extents(int fd,off_t size,int (*visit)(off_t,off_t,void *),void *ctx){
+    off_t pos=0;
+    while(pos<size){
+        off_t data=lseek(fd,pos,SEEK_DATA),hole;
+        if(data<0){
+            if(errno==ENXIO)return 0;
+            if(errno!=EINVAL&&errno!=ENOTSUP)return -1;
+            data=pos;hole=size;
+        }else{
+            if(data>=size)return 0;
+            hole=lseek(fd,data,SEEK_HOLE);
+            if(hole<0)return -1;
+            if(hole>size)hole=size;
+        }
+        if(visit(data,hole-data,ctx))return -1;
+        pos=hole;
+    }
+    return 0;
+}
 #endif

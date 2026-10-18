@@ -2,6 +2,7 @@
 // Bring-up laboratory; deliberately independent of the Linux Firecracker VMM.
 #include <Hypervisor/Hypervisor.h>
 #include <sys/mman.h>
+#include <sys/clonefile.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -312,26 +313,56 @@ static int snapshot_gic(int restore){
     if(restore && !io.error && hv_gic_set_state(data,size))io.error=1;
     int failed=snapshot_end(&io);free(data);if(state)os_release(state);close(fd);return failed;
 }
+struct sparse_copy {int source,target;uint8_t buffer[131072];};
+static int copy_extent(off_t offset,off_t length,void *ctx){
+    struct sparse_copy *c=ctx;
+    for(off_t at=offset,end=offset+length;at<end;){
+        size_t n=(uint64_t)(end-at)>sizeof(c->buffer)?sizeof(c->buffer):(size_t)(end-at);
+        ssize_t r=pread(c->source,c->buffer,n,at);
+        if(r<0&&errno==EINTR)continue;
+        if(r<=0||snapshot_write_sparse(c->target,c->buffer,(size_t)r,at))return -1;
+        at+=r;
+    }
+    return 0;
+}
+// A paused guest's disk is captured as a clone of the VMM's descriptor, which
+// shares its blocks. Where cloning is refused (another volume, the sandbox),
+// only the disk's data extents are copied and zero pages stay holes.
+static int snapshot_disk(int source,const char *name,off_t size){
+    if(fclonefileat(source,snapshot_dirfd,name,0)==0){
+        int fd=openat(snapshot_dirfd,name,O_RDONLY|O_NOFOLLOW);if(fd<0)return -1;
+        struct stat st;int failed=fstat(fd,&st)||!S_ISREG(st.st_mode)||st.st_nlink!=1||st.st_size!=size||fsync(fd);
+        close(fd);return failed?-1:0;
+    }
+    int fd=snapshot_open(name,0);if(fd<0)return -1;
+    struct sparse_copy *c=malloc(sizeof(*c));if(!c){close(fd);return -1;}
+    c->source=source;c->target=fd;
+    int failed=ftruncate(fd,size)||snapshot_extents(source,size,copy_extent,c)||fsync(fd);
+    free(c);close(fd);return failed?-1:0;
+}
 static int snapshot_save(void *ram,uint64_t frozen_ticks){
     struct rlimit limit;if(getrlimit(RLIMIT_FSIZE,&limit)||ram_size>limit.rlim_cur)return -1;
     for(unsigned i=0;i<options->drive_count;i++){struct stat st;if(fstat(options->drives[i].fd,&st)||(uint64_t)st.st_size>limit.rlim_cur)return -1;}
     if(snapshot_state(0,frozen_ticks)||snapshot_gic(0))return -1;
     int fd=snapshot_open("ram.bin",0);if(fd<0)return -1;
-    struct snapshot_io io={.fd=fd};
-    for(size_t offset=0;offset<ram_size&&!io.error;offset+=131072){size_t size=ram_size-offset;if(size>131072)size=131072;snapshot_bytes(&io,(uint8_t*)ram+offset,size);}
-    int failed=snapshot_end(&io);close(fd);if(failed)return -1;
-    uint8_t buffer[131072];
+    int failed=ftruncate(fd,(off_t)ram_size)||snapshot_write_sparse(fd,ram,ram_size,0)||fsync(fd);
+    close(fd);if(failed)return -1;
     for(unsigned i=0;i<options->drive_count;i++){
         struct stat st;int source=options->drives[i].fd;
         if(fstat(source,&st)||st.st_size<512||st.st_size>(1LL<<40)||fsync(source))return -1;
-        char name[32];snprintf(name,sizeof(name),"disk-%u.bin",i);fd=snapshot_open(name,0);if(fd<0)return -1;
-        io=(struct snapshot_io){.fd=fd};
-        for(off_t offset=0;offset<st.st_size&&!io.error;){
-            size_t size=(uint64_t)(st.st_size-offset)>sizeof(buffer)?sizeof(buffer):(size_t)(st.st_size-offset);
-            ssize_t n=pread(source,buffer,size,offset);if(n<0&&errno==EINTR)continue;
-            if(n<=0){io.error=1;break;}snapshot_bytes(&io,buffer,(size_t)n);offset+=n;
-        }
-        failed=snapshot_end(&io);close(fd);if(failed)return -1;
+        char name[32];snprintf(name,sizeof(name),"disk-%u.bin",i);
+        if(snapshot_disk(source,name,st.st_size))return -1;
+    }
+    return 0;
+}
+struct ram_load {int fd;uint8_t *ram;};
+static int load_extent(off_t offset,off_t length,void *ctx){
+    struct ram_load *l=ctx;
+    for(off_t at=offset,end=offset+length;at<end;){
+        ssize_t n=pread(l->fd,l->ram+at,(size_t)(end-at),at);
+        if(n<0&&errno==EINTR)continue;
+        if(n<=0)return -1;
+        at+=n;
     }
     return 0;
 }
@@ -349,13 +380,10 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
     if(fd<0||fstat(fd,&st)||st.st_size<=0 || (uint64_t)st.st_size>ram_size){fprintf(stderr,"RAM image length does not match configured memory\n");if(fd>=0)close(fd);return 1;}
     void *ram=mmap(NULL,ram_size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
     if(ram==MAP_FAILED){perror("mmap");close(fd);return 1;}
-    size_t loaded=0;
-    while(loaded<(size_t)st.st_size){
-        ssize_t n=pread(fd,(uint8_t*)ram+loaded,(size_t)st.st_size-loaded,loaded);
-        if(n<0 && errno==EINTR)continue;
-        if(n<=0){perror("read RAM image");close(fd);munmap(ram,ram_size);return 1;}
-        loaded+=n;
-    }
+    // Holes in the image are guest pages of zeros: they are left untouched in
+    // the fresh anonymous mapping, which costs no memory until the guest uses them.
+    struct ram_load load={.fd=fd,.ram=ram};
+    if(snapshot_extents(fd,st.st_size,load_extent,&load)){perror("read RAM image");close(fd);munmap(ram,ram_size);return 1;}
     close(fd);
     input_init(ram,ram_size,options->power_button);
     if(devices_init(ram,ram_size,disk,options)){perror("disk");devices_close();munmap(ram,ram_size);return 1;}

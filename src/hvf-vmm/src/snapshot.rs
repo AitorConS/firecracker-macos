@@ -4,7 +4,7 @@ use crate::{Config, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -90,42 +90,42 @@ fn copy_hash(
     maximum: u64,
     cancel: &AtomicBool,
 ) -> Result<Component> {
-    let mut source = regular(source)?;
+    let source = regular(source)?;
     let before = source.metadata()?;
     if before.len() > maximum {
         return Err("snapshot component exceeds size limit".into());
     }
-    let mut output = target
-        .map(|p| {
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(p)
-        })
-        .transpose()?;
-    let mut buffer = [0u8; 131072];
-    let mut hash = Sha256::new();
-    let mut total = 0u64;
-    loop {
-        cancelled(cancel)?;
-        let n = source.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        total = total
-            .checked_add(n as u64)
-            .ok_or("snapshot size overflow")?;
-        if total > maximum || total > before.len() {
-            return Err("snapshot component grew during copy".into());
-        }
-        hash.update(&buffer[..n]);
-        if let Some(out) = &mut output {
-            out.write_all(&buffer[..n])?;
+    // On APFS the copy is a clone of the source, made before hashing; the
+    // unchanged modification time below proves the clone and the hash saw the
+    // same bytes. Otherwise only data is copied and zeros stay holes. Holes
+    // are hashed as zeros without being read.
+    let mut cloned = None;
+    let mut output = None;
+    if let Some(p) = target {
+        if crate::sparse::clone_to(&source, p)? {
+            fs::set_permissions(p, fs::Permissions::from_mode(0o600))?;
+            cloned = Some(p);
+        } else {
+            output = Some(
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(p)?,
+            );
         }
     }
+    let mut hash = Sha256::new();
+    let mut update = |bytes: &[u8]| hash.update(bytes);
+    crate::sparse::copy(
+        &source,
+        before.len(),
+        output.as_ref(),
+        Some(&mut update),
+        &|| cancelled(cancel),
+    )?;
     let after = source.metadata()?;
-    if total != before.len()
+    if after.len() != before.len()
         || before.mtime() != after.mtime()
         || before.mtime_nsec() != after.mtime_nsec()
     {
@@ -134,8 +134,11 @@ fn copy_hash(
     if let Some(out) = output {
         out.sync_all()?;
     }
+    if let Some(p) = cloned {
+        File::open(p)?.sync_all()?;
+    }
     Ok(Component {
-        size: total,
+        size: before.len(),
         sha256: hash.finish(),
     })
 }

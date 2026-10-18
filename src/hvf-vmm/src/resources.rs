@@ -2,10 +2,9 @@
 //! Stage selected boot inputs from validated, locked descriptors before exec.
 use crate::Result;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 fn open_validated(path: &Path, writable: bool, expected: &std::fs::Metadata) -> Result<File> {
@@ -36,7 +35,7 @@ pub(crate) fn stage(
     maximum: u64,
     cancel: &AtomicBool,
 ) -> Result<PathBuf> {
-    let mut source = open_regular(path, false)?;
+    let source = open_regular(path, false)?;
     let metadata = source.metadata()?;
     if !metadata.is_file() || metadata.len() > maximum {
         return Err("boot input exceeds its size limit or is not regular".into());
@@ -45,29 +44,26 @@ pub(crate) fn stage(
     if unsafe { libc::flock(source.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
         return Err("boot input lock failed".into());
     }
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(destination)?;
-    let mut buffer = vec![0u8; 128 << 10];
-    let mut total = 0u64;
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("boot input staging cancelled".into());
-        }
-        let n = source.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        total = total
-            .checked_add(n as u64)
-            .ok_or("boot input size overflow")?;
-        if total > maximum {
-            return Err("boot input grew beyond its size limit".into());
-        }
-        output.write_all(&buffer[..n])?;
-    }
+    // A clone shares the input's blocks; otherwise only data is copied and
+    // zeros (most of a snapshot's RAM image) stay holes.
+    let output = if crate::sparse::clone_to(&source, destination)? {
+        std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))?;
+        File::open(destination)?
+    } else {
+        let output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(destination)?;
+        let check = || -> Result<()> {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("boot input staging cancelled".into());
+            }
+            Ok(())
+        };
+        crate::sparse::copy(&source, metadata.len(), Some(&output), None, &check)?;
+        output
+    };
     output.sync_all()?;
     Ok(destination.to_owned())
 }

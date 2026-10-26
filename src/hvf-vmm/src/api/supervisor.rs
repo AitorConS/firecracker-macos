@@ -55,16 +55,64 @@ pub(super) struct Guest(
     pub crate::limits::Watchdog,
     pub Option<Value>,
 );
+/// startup.log stays under LOG_MAX_BYTES: the VMM appends its stderr there,
+/// and output a guest can trigger must not fill the host disk. Trimming keeps
+/// the first LOG_HEAD_BYTES (early boot) and the last LOG_TAIL_BYTES (what
+/// `Guest::diagnostic` reports).
+const LOG_MAX_BYTES: u64 = 8 << 20;
+const LOG_HEAD_BYTES: u64 = 1 << 20;
+const LOG_TAIL_BYTES: u64 = 64 << 10;
+
+/// Opens the VMM's log without following a link the VMM may have put there.
+fn open_log(path: &Path, write: bool) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .append(write)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.nlink() != 1 {
+        return Err(std::io::Error::other(
+            "startup.log is not a private regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Trims the log at `path` back to its head and tail once it exceeds LOG_MAX_BYTES.
+pub(super) fn cap_log(path: &Path) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = open_log(path, true)?;
+    let length = file.metadata()?.len();
+    if length <= LOG_MAX_BYTES {
+        return Ok(());
+    }
+    let mut tail = Vec::new();
+    file.seek(SeekFrom::Start(length - LOG_TAIL_BYTES))?;
+    (&mut file).take(LOG_TAIL_BYTES).read_to_end(&mut tail)?;
+    file.set_len(LOG_HEAD_BYTES)?;
+    // Appends: anything the VMM writes meanwhile lands after, not inside, this.
+    let dropped = length - LOG_HEAD_BYTES - LOG_TAIL_BYTES;
+    file.write_all(format!("\n[startup.log: {dropped} bytes dropped]\n").as_bytes())?;
+    file.write_all(&tail)
+}
+
 impl Guest {
     pub fn diagnostic(&self) -> String {
         use std::io::{Seek, SeekFrom};
         let mut bytes = Vec::new();
-        if let Ok(mut file) = fs::File::open(self.1.path().join("startup.log")) {
+        if let Ok(mut file) = open_log(&self.1.path().join("startup.log"), false) {
             let length = file.metadata().map(|m| m.len()).unwrap_or(0);
-            let _ = file.seek(SeekFrom::Start(length.saturating_sub(65536)));
-            let _ = file.take(65536).read_to_end(&mut bytes);
+            let _ = file.seek(SeekFrom::Start(length.saturating_sub(LOG_TAIL_BYTES)));
+            let _ = file.take(LOG_TAIL_BYTES).read_to_end(&mut bytes);
         }
         String::from_utf8_lossy(&bytes).trim().to_owned()
+    }
+    /// Keeps the VMM's log bounded; called with the resource watchdog. The log
+    /// is diagnostics only, so a failure leaves it as it is.
+    pub fn cap_log(&self) {
+        let _ = cap_log(&self.1.path().join("startup.log"));
     }
     pub fn kill_group(&mut self) -> std::io::Result<()> {
         // The leader is owned and unreaped, preventing reuse of its group ID.
@@ -213,7 +261,13 @@ fn launch(
                 .collect::<Vec<_>>()
                 .join(","),
         )
-        .stderr(fs::File::create(&log_path)?);
+        // Append-only, so cap_log can shorten it while the VMM keeps writing.
+        .stderr(
+            fs::OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .open(&log_path)?,
+        );
     // SAFETY: only async-signal-safe fcntl executes between fork and exec. The
     // private socket descriptor remains alive until spawn completes.
     unsafe {
@@ -258,6 +312,7 @@ fn launch(
             resource_error = Some(error);
             break false;
         }
+        guest.cap_log();
         if SHUTDOWN.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
             reason = "startup cancelled by supervisor shutdown";
             break false;
@@ -331,5 +386,61 @@ pub(super) fn restore_task(
     StartTask {
         cancel,
         thread: Some(thread),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn log_file(dir: &Path, bytes: &[u8]) -> PathBuf {
+        let path = dir.join("startup.log");
+        fs::File::create(&path).unwrap().write_all(bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn cap_log_keeps_head_and_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = vec![b'h'; LOG_HEAD_BYTES as usize];
+        bytes.resize((LOG_MAX_BYTES + 1) as usize - LOG_TAIL_BYTES as usize, b'x');
+        bytes.resize((LOG_MAX_BYTES + 1) as usize, b't');
+        let path = log_file(dir.path(), &bytes);
+        cap_log(&path).unwrap();
+        let trimmed = fs::read(&path).unwrap();
+        assert!(trimmed.len() < (LOG_HEAD_BYTES + LOG_TAIL_BYTES + 100) as usize);
+        assert!(
+            trimmed[..LOG_HEAD_BYTES as usize]
+                .iter()
+                .all(|&b| b == b'h')
+        );
+        assert!(
+            trimmed[trimmed.len() - LOG_TAIL_BYTES as usize..]
+                .iter()
+                .all(|&b| b == b't')
+        );
+        let marker = String::from_utf8_lossy(
+            &trimmed[LOG_HEAD_BYTES as usize..trimmed.len() - LOG_TAIL_BYTES as usize],
+        )
+        .into_owned();
+        assert!(marker.contains("bytes dropped"), "{marker}");
+        // Under the cap nothing changes.
+        cap_log(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), trimmed);
+    }
+
+    #[test]
+    fn cap_log_refuses_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("other");
+        fs::write(&target, vec![b'o'; (LOG_MAX_BYTES + 1) as usize]).unwrap();
+        let link = dir.path().join("startup.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(cap_log(&link).is_err());
+        fs::remove_file(&link).unwrap();
+        fs::hard_link(&target, &link).unwrap();
+        assert!(cap_log(&link).is_err());
+        assert_eq!(fs::metadata(&target).unwrap().len(), LOG_MAX_BYTES + 1);
     }
 }

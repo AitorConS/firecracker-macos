@@ -43,6 +43,11 @@ static uint8_t mac[6];
 // Segments of the TX head already handed to the switch when its socket
 // filled mid-frame; a retry continues from there instead of repeating them.
 static unsigned tx_resume;
+// The descriptor head and TX ring tx_resume belongs to. A retry of anything
+// else, or of that head rewritten as a frame without TSO, starts over and
+// takes the budget again: each frame is charged exactly once.
+static uint16_t tx_resume_head;
+static uint32_t tx_resume_pfn;
 static uint8_t staging[65536]; // segments and completed checksums; io_lock held
 static void die(const char *why) {fprintf(stderr,"net error: %s\n",why);exit(2);}
 static uint64_t get(const void *p,unsigned n){uint64_t v=0;memcpy(&v,p,n);return v;}
@@ -219,6 +224,7 @@ static void transmit(void){
         struct vnet_hdr hd;vnet_hdr_decode(frame,&hd);
         if((hd.flags&~VNET_F_NEEDS_CSUM)||((hd.flags&VNET_F_NEEDS_CSUM)&&!(features&NET_F_CSUM))||
            (hd.gso_type&&(hd.gso_type!=VNET_GSO_TCPV4||!(features&NET_F_HOST_TSO4))))die("TX header/offload unsupported");
+        if(tx_resume&&(h!=tx_resume_head||q->pfn!=tx_resume_pfn||!hd.gso_type))tx_resume=0;
         if(!tx_resume&&!budget_take(&network_budget,len-10,1))break;
         // A full socket is backpressure, not packet loss. Leave this
         // descriptor available and retry it on the next supervisor poll.
@@ -228,7 +234,11 @@ static void transmit(void){
         if(sent<0)sent=to_switch(frame+10,len-10,&hd);
         // Nothing left the device: the retry takes the budget again. A TSO
         // frame cut short (tx_resume) keeps it for its remaining segments.
-        if(!sent){if(!tx_resume)budget_refund(&network_budget,len-10,1);break;}
+        if(!sent){
+            if(tx_resume){tx_resume_head=h;tx_resume_pfn=q->pfn;}
+            else budget_refund(&network_budget,len-10,1);
+            break;
+        }
         complete(q,h,0);tx++;tx_bytes+=len-10;
     }
 }
@@ -255,7 +265,7 @@ int net_mmio(uint64_t addr,unsigned size,int write,uint64_t *v){
     unsigned off=addr-base;struct queue *q=selectq<2?&queues[selectq]:NULL;
     if(write){switch(off){
         case 4:if(size!=4||(*v&~NET_FEATURES))return 0;features=*v;break;
-        case 8:if(size!=4||!q)return 0;*q=(struct queue){.pfn=*v};break;
+        case 8:if(size!=4||!q)return 0;*q=(struct queue){.pfn=*v};if(q==&queues[1])tx_resume=0;break;
         case 14:if(size!=2)return 0;selectq=*v;break;
         case 16:if(size!=2||*v>1)return 0;if(*v==1)transmit();else net_backend_kick();break;
         case 18:if(size!=1)return 0;status=*v;if(!status){memset(queues,0,sizeof(queues));features=0;isr=0;tx_resume=0;irq(0);}break;

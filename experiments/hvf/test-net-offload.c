@@ -121,6 +121,35 @@ static void test_tx_to_switch(void){
     tx(packet,len);
     assert(sends==1&&sent_len[0]==len-10&&tcp_valid(sent[0],sent_len[0]));
 }
+// A TSO frame cut short is resumed only as that same frame: if the guest
+// rewrites the retained descriptor as a frame without TSO, the resume state is
+// dropped, so later frames start at their first segment and take the budget.
+static void test_tx_resume_bound_to_frame(void){
+    static uint8_t packet[65536];
+    setup(FEATURES);reset_slots();sends=0;
+    size_t len=tso_packet(packet,5000,1000);
+    fail_at=2;
+    tx(packet,len);
+    assert(sends==2&&*used_idx(TX_RING)==0);
+    // The guest swaps the retained frame for a plain one before the retry.
+    size_t plain=tso_packet(memory+TX_BUF,777,0);
+    ((struct descriptor *)(memory+TX_RING))[0].len=(uint32_t)plain;
+    net_poll();
+    assert(sends==3&&sent_len[2]==plain-10&&*used_idx(TX_RING)==1);
+    // The next TSO frame goes out whole, from its first segment.
+    sends=0;
+    tx(packet,len);
+    assert(sends==5&&*used_idx(TX_RING)==2);
+    for(unsigned i=0;i<5;i++)assert(seq(sent[i])==0x1000+i*1000);
+    // Moving the TX ring also drops a pending resume.
+    setup(FEATURES);reset_slots();sends=0;fail_at=2;
+    tx(packet,len);
+    assert(sends==2);
+    write_reg(14,2,1);write_reg(8,4,(BASE+TX_RING)>>12);
+    memset(memory+TX_RING,0,3*4096);reset_slots();sends=0;
+    tx(packet,len);
+    assert(sends==5&&seq(sent[0])==0x1000);
+}
 static void test_rx_from_peer(void){
     static uint8_t packet[65536];
     size_t len=tso_packet(packet,30000,8960);
@@ -239,6 +268,7 @@ int main(void){
     struct hvf_options options={.network_enabled=1};
     assert(net_init(memory,SIZE,&options)==0);
     test_tx_to_switch();
+    test_tx_resume_bound_to_frame();
     test_rx_from_peer();
     test_rx_oversized();
     test_switch_capabilities();

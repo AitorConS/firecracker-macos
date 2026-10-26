@@ -15,3 +15,4 @@ sh experiments/hvf/build-native.sh
 cargo test --locked -p hvf-vmm --target aarch64-apple-darwin
 cargo clippy --locked -p hvf-vmm -p firecracker --target aarch64-apple-darwin -- -D warnings
 sh experiments/hvf/test-device-faults.sh
+sh experiments/hvf/test-net-offload.sh

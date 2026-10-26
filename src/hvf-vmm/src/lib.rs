@@ -17,6 +17,7 @@ mod loader;
 mod resources;
 mod security;
 mod snapshot;
+mod sparse;
 mod tree;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;

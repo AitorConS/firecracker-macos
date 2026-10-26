@@ -77,11 +77,22 @@ static void complete(struct queue *q,uint16_t h,uint32_t n){
         isr=1;irq(1);
     }
 }
-// Writes header and frame into the next RX chain as one virtio packet.
+// Writes header and frame into the next RX chain as one virtio packet. A
+// frame larger than the chain is dropped and the chain left for the next
+// frame: frames come from other guests and the switch, and must never stop
+// this VM.
 static void deliver(const uint8_t header[10],const uint8_t *frame,size_t len){
     struct queue *q=&queues[0];
-    size_t total=len+10,done=0;
+    size_t total=len+10,done=0,room=0;
     uint16_t h=head(q),i=h;unsigned count=0;
+    for(;;){
+        if(++count>QSZ)die("RX cycle");struct desc d=desc(q,i);
+        if(!(d.flags&2))die("RX direction");
+        room+=d.len;
+        if(room>=total||!(d.flags&1))break;i=d.next;
+    }
+    if(room<total){drop_packets++;drop_bytes+=len;return;}
+    i=h;count=0;
     while(done<total){
         if(++count>QSZ)die("RX cycle");struct desc d=desc(q,i);
         if(!(d.flags&2))die("RX direction");
@@ -149,7 +160,7 @@ static ssize_t receive(const void *buf,size_t len,void *opaque){
            ((hd.flags&VNET_F_NEEDS_CSUM)&&(size_t)hd.csum_start+hd.csum_offset+2>len)){
             drop_packets++;drop_bytes+=len;return (ssize_t)len;
         }
-    }else if(len>65536-10)die("oversized frame");
+    }else if(len>65536-10){drop_packets++;drop_bytes+=len;return (ssize_t)len;}
     int tso=(features&NET_F_GUEST_TSO4)&&(features&NET_F_GUEST_CSUM);
     if(hd.gso_type&&!tso){
         // A guest without TSO receives the segments it would have seen on a wire.

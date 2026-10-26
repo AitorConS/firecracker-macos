@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{Drive, Result};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 fn lock(file: &File, readonly: bool) -> Result<()> {
@@ -35,37 +35,39 @@ pub(super) fn open_cancellable(
     maximum: u64,
 ) -> Result<File> {
     let writable = !drive.copy_on_start && !drive.is_read_only;
-    let mut source = crate::resources::open_regular(&drive.path_on_host, writable)?;
+    let source = crate::resources::open_regular(&drive.path_on_host, writable)?;
     lock(&source, drive.copy_on_start || drive.is_read_only)?;
     if !drive.copy_on_start {
         return Ok(source);
     }
-    if source.metadata()?.len() > maximum {
+    let size = source.metadata()?.len();
+    if size > maximum {
         return Err("disk copy exceeds file size limit".into());
     }
-    let mut total = 0u64;
-    let mut target = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(copy)?;
     // Copy from the very descriptor whose inode we locked. Keep the source lock
     // throughout copying, including failures; never reopen the path for copying.
-    let mut buffer = vec![0u8; 128 << 10];
-    loop {
-        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-            return Err("disk copy cancelled".into());
-        }
-        let n = source.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        total = total.checked_add(n as u64).ok_or("disk copy overflow")?;
-        if total > maximum {
-            return Err("disk copy grew beyond size limit".into());
-        }
-        target.write_all(&buffer[..n])?;
-    }
+    // On APFS the copy is a clone sharing the source's blocks; otherwise only
+    // its data is copied and runs of zeros stay holes.
+    let target = if crate::sparse::clone_to(&source, copy)? {
+        // A clone keeps the source's mode, which may be read-only.
+        std::fs::set_permissions(copy, std::fs::Permissions::from_mode(0o600))?;
+        OpenOptions::new().read(true).write(true).open(copy)?
+    } else {
+        let target = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(copy)?;
+        let check = || -> Result<()> {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err("disk copy cancelled".into());
+            }
+            Ok(())
+        };
+        crate::sparse::copy(&source, size, Some(&target), None, &check)?;
+        target
+    };
     target.sync_all()?;
     lock(&target, drive.is_read_only)?;
     Ok(target)
@@ -93,6 +95,30 @@ mod tests {
         lock(&f, false).unwrap();
         assert!(open(&drive(&source, true), &t.path().join("copy")).is_err());
         assert!(!t.path().join("copy").exists());
+    }
+    // Jerboa keeps stored disks read-only; their private copy must be
+    // writable, hold the same bytes and keep the source's holes.
+    #[test]
+    fn copy_of_read_only_sparse_source_is_writable() {
+        use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("source");
+        let f = File::create(&source).unwrap();
+        f.set_len(64 << 20).unwrap();
+        f.write_all_at(b"boot", 0).unwrap();
+        f.write_all_at(b"tail", (64 << 20) - 512).unwrap();
+        drop(f);
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let mut d = drive(&source, true);
+        d.is_read_only = false;
+        let copy = open(&d, &t.path().join("copy")).unwrap();
+        assert_eq!(
+            std::fs::read(t.path().join("copy")).unwrap(),
+            std::fs::read(&source).unwrap()
+        );
+        copy.write_all_at(b"x", 4096).unwrap();
+        assert!(copy.metadata().unwrap().blocks() * 512 < 4 << 20);
+        assert_eq!(std::fs::read(&source).unwrap()[4096], 0);
     }
     #[test]
     fn copy_is_private_and_persistent_writer_is_exclusive() {

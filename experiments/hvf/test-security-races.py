@@ -9,7 +9,7 @@ ROOT=Path(__file__).resolve().parents[2]
 
 def main():
  p=argparse.ArgumentParser(description=__doc__);p.add_argument('--source-dir',type=Path,default=ROOT/'src/hvf-vmm/src');p.add_argument('--output',type=Path,required=True);p.add_argument('--expect-control-failures',action='store_true');a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True);out=a.output.resolve();src=a.source_dir.resolve();hashes={}
- for name in ['resources.rs','block.rs','security.rs']:
+ for name in ['resources.rs','block.rs','security.rs','sparse.rs']:
   text=(src/name).read_text();hashes[name]=hashlib.sha256(text.encode()).hexdigest()
   if name=='resources.rs':
    if 'open_validated(path, writable, &expected)' in text:
@@ -35,7 +35,7 @@ tempfile="=3.27.0"
  (out/'lib.rs').write_text('''#![allow(dead_code)]
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 struct Drive {drive_id:String,path_on_host:std::path::PathBuf,is_root_device:bool,copy_on_start:bool,is_read_only:bool}
-mod resources; mod block; mod security;
+mod resources; mod block; mod security; mod sparse;
 thread_local! {static HOOK:std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);}
 fn run_hook(){let hook=HOOK.with(|h|h.borrow_mut().take());if let Some(h)=hook {h();}}
 fn race(disk:bool,kind:u8){

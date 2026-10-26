@@ -218,12 +218,29 @@ static void test_switch_capabilities(void){
     assert(receive(packet+10,len-10,NULL)==(ssize_t)(len-10));
     net_metrics(metrics);assert(metrics[4]==drops+1&&*used_idx(RX_RING)==0);
 }
+// Frames larger than the guest's RX chain, or than any virtio packet, are
+// dropped and counted; the VM keeps running and the chain takes the next one.
+static void test_rx_oversized(void){
+    static uint8_t frame[65536];
+    uint64_t metrics[8];
+    setup(0x20);reset_slots();post_rx(1,100);
+    memset(frame,0,sizeof(frame));memcpy(frame,"\x02\0\0\0\0\x01",6);
+    frame[12]=0x08;
+    net_metrics(metrics);uint64_t drops=metrics[4];
+    assert(receive(frame,200,NULL)==200);
+    net_metrics(metrics);assert(metrics[4]==drops+1&&*used_idx(RX_RING)==0);
+    assert(receive(frame,65530,NULL)==65530);
+    net_metrics(metrics);assert(metrics[4]==drops+2&&*used_idx(RX_RING)==0);
+    assert(receive(frame,60,NULL)==60);
+    assert(*used_idx(RX_RING)==1&&*used_len(RX_RING,0)==70);
+}
 int main(void){
     memory=calloc(1,SIZE);assert(memory);
     struct hvf_options options={.network_enabled=1};
     assert(net_init(memory,SIZE,&options)==0);
     test_tx_to_switch();
     test_rx_from_peer();
+    test_rx_oversized();
     test_switch_capabilities();
     net_close();free(memory);
     puts("net-offload: ok");

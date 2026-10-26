@@ -207,6 +207,7 @@ fn serve_inner(socket: &Path, initial: Option<Config>, headless: bool) -> Result
                 process.kill_group()?;
             }
             process.4.poll();
+            process.cap_log();
             match process.3.receive(&mut process.2) {
                 Ok(Some(message))
                     if message

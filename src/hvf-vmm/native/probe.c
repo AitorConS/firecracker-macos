@@ -252,13 +252,15 @@ static void *cpu_main(void *arg) {
                 CHECK(hv_vcpu_get_reg(c->id,HV_REG_X1,&target));
                 CHECK(hv_vcpu_get_reg(c->id,HV_REG_X2,&entry));
                 CHECK(hv_vcpu_get_reg(c->id,HV_REG_X3,&context));
-                fprintf(stderr,"CPU_ON target=%llx entry=%llx context=%llx\n",target,entry,context);
                 ret=(uint64_t)-2;
                 if(target<ncpus && entry>=RAM_BASE && entry<RAM_BASE+ram_size && !(entry&3)) {
                     pthread_mutex_lock(&state_lock);
                     struct cpu *other=&cpus[target];
                     if(other->started)ret=(uint64_t)-4;
                     else {other->entry=entry;other->context=context;other->started=1;ret=0;pthread_cond_broadcast(&state_change);}
+                    // Logged only when accepted: at most once per vCPU, so a
+                    // guest looping on CPU_ON cannot grow the log.
+                    if(!ret)fprintf(stderr,"CPU_ON target=%llx entry=%llx context=%llx\n",target,entry,context);
                     pthread_mutex_unlock(&state_lock);
                 }
             }

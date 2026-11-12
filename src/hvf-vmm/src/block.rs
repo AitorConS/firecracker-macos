@@ -68,7 +68,9 @@ pub(super) fn open_cancellable(
         crate::sparse::copy(&source, size, Some(&target), None, &check)?;
         target
     };
-    target.sync_all()?;
+    // The copy is this run's private disk and is deleted with the workspace:
+    // nothing reads it after a crash, so only the guest's own flushes reach
+    // the disk.
     lock(&target, drive.is_read_only)?;
     Ok(target)
 }

@@ -30,6 +30,8 @@ pub(crate) const MAX_VCPUS: u32 = 8;
 pub(crate) const MIN_MEMORY_MIB: u32 = 64;
 pub(crate) const MAX_MEMORY_MIB: u32 = 8192;
 pub(crate) const MAX_DRIVES: usize = 4;
+/// The largest MTU of a slirp link, the one the switch networks use.
+pub(crate) const MAX_SLIRP_MTU: u32 = 9000;
 /// The part of GET /capabilities that depends only on the build: what a
 /// launcher must know before it writes a config.
 pub(crate) fn static_capabilities() -> serde_json::Value {
@@ -42,6 +44,7 @@ pub(crate) fn static_capabilities() -> serde_json::Value {
         "boot_protocols": ["elf", "linux-image"],
         "network_backends": ["slirp", "unix-stream"],
         "peer_control": true,
+        "slirp_mtu_max": MAX_SLIRP_MTU,
     })
 }
 // Native fatal errors terminate the process; preserve private-file cleanup in that
@@ -98,6 +101,10 @@ struct Network {
     socket_path: Option<PathBuf>,
     #[serde(default)]
     forwards: Vec<Forward>,
+    /// The MTU of the slirp link, 1500 when absent. The guest must be
+    /// configured with the same value: slirp sends it frames of this size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mtu: Option<u32>,
 }
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -220,6 +227,14 @@ impl Config {
                 || net.forwards.len() > 64
             {
                 return Err("invalid network interface or backend".into());
+            }
+            if let Some(mtu) = net.mtu
+                && (net.backend != "slirp" || !(576..=MAX_SLIRP_MTU).contains(&mtu))
+            {
+                return Err(format!(
+                    "mtu is for the slirp backend, 576..{MAX_SLIRP_MTU}; a unix-stream link takes it from its switch"
+                )
+                .into());
             }
             if net.backend == "unix-stream" {
                 let path = net
@@ -360,6 +375,7 @@ struct NativeOptions {
     stream_path: *const std::ffi::c_char,
     control_path: *const std::ffi::c_char,
     restore: u32,
+    mtu: u32,
     cpu_seconds: u64,
     disk_bytes_per_second: u64,
     disk_operations_per_second: u64,
@@ -558,6 +574,7 @@ fn run(config: Config) -> Result<i32> {
             .as_ref()
             .map_or(std::ptr::null(), |p| p.as_ptr()),
         restore: (std::env::var("HVF_RESTORE").as_deref() == Ok("1")).into(),
+        mtu: net.and_then(|n| n.mtu).unwrap_or(0),
         cpu_seconds: config.limits.cpu_seconds,
         disk_bytes_per_second: config.limits.disk_bytes_per_second,
         disk_operations_per_second: config.limits.disk_operations_per_second,
@@ -737,5 +754,21 @@ mod stream_config_tests {
         c.security.as_mut().unwrap().unix_stream = None;
         c.security.as_mut().unwrap().unix_control = Some("/private/tmp/link.ctl".into());
         assert!(c.validate_shape().is_err());
+    }
+    #[test]
+    fn mtu_is_for_slirp_and_bounded() {
+        let mut c = config();
+        c.network_interfaces[0].mtu = Some(9000);
+        assert!(c.validate_shape().is_err(), "a unix-stream link takes its MTU from the switch");
+        c.network_interfaces[0].backend = "slirp".into();
+        c.network_interfaces[0].socket_path = None;
+        c.security.as_mut().unwrap().unix_stream = None;
+        for (mtu, valid) in [(None, true), (Some(576), true), (Some(9000), true), (Some(575), false), (Some(9001), false)] {
+            c.network_interfaces[0].mtu = mtu;
+            assert_eq!(c.validate_shape().is_ok(), valid, "{mtu:?}");
+        }
+        // A config without the field is handed to the VMM without it.
+        c.network_interfaces[0].mtu = None;
+        assert!(!serde_json::to_string(&c).unwrap().contains("mtu"));
     }
 }

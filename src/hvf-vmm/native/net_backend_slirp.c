@@ -98,7 +98,9 @@ void slirp_backend_poll(void){
 int slirp_backend_open(const struct hvf_options *options,net_receive_fn receive){
     receive_packet=receive;paused_at=clock_offset=0;memset(aliased,0,sizeof(aliased));
     hvf_policy_set(options->security);
-    SlirpConfig c={.version=6,.in_enabled=true,.if_mtu=1500,.if_mru=1500,.disable_host_loopback=false};
+    // The guest is configured with the same MTU by whoever wrote the config.
+    size_t mtu=options->mtu?options->mtu:1500;
+    SlirpConfig c={.version=6,.in_enabled=true,.if_mtu=mtu,.if_mru=mtu,.disable_host_loopback=false};
     c.disable_dns=!(options->security && (options->security->development || options->security->dns_port));
     inet_pton(AF_INET,"10.0.2.0",&c.vnetwork);inet_pton(AF_INET,"255.255.255.0",&c.vnetmask);
     inet_pton(AF_INET,"10.0.2.2",&c.vhost);inet_pton(AF_INET,"10.0.2.15",&c.vdhcp_start);inet_pton(AF_INET,"10.0.2.3",&c.vnameserver);

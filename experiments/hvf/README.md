@@ -76,6 +76,10 @@ Both boot in EL1 with MMU off, masked interrupts, x0=DTB,
 x1=x2=x3=0. RAM at `0x40000000`; 1–8 CPUs and 64–8192 MiB of configurable RAM.
 `firecracker --capabilities` prints these bounds, the drive limit and whether
 direct VM-to-VM links are supported, as JSON, so a launcher need not hard-code them.
+A slirp interface takes an optional `mtu` (576 to 9000, 1500 when absent; the
+limit is `slirp_mtu_max` in the capabilities). The guest must be configured
+with the same value. At 9000, TCP through a forwarded port runs about twice as
+fast towards the guest and four times as fast from it.
 VMM capacity does not imply that any guest fits in 64 MiB.
 The Linux example is validated with 256 MiB. Output-only PL011 console, GICv3, PSCI,
 legacy VirtIO PCI and MMIO fw_cfg. No interactive input console is offered.

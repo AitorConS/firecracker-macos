@@ -202,7 +202,17 @@ mod tests {
         );
         marker.owner.seconds -= 1;
         write(&marker);
-        recover_one(directory.path()).unwrap();
+        // Another test's Workspace::new() scans the same temporary directory
+        // and holds this lease's lock while it reads the marker; recovery
+        // then leaves the directory for a later pass, as it should. Try
+        // again rather than fail on that.
+        for _ in 0..200 {
+            let _ = recover_one(directory.path());
+            if !directory.path().exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert!(
             !directory.path().exists(),
             "PID reuse must not identify the unrelated process as owner"

@@ -7,9 +7,14 @@ slirp=src/hvf-vmm/vendor/libslirp/src
 native=src/hvf-vmm/native
 out=experiments/hvf/build/fuzz-slirp
 mkdir -p "$out/objects" "$out/corpus" "$out/artifacts"
+# libslirp keeps its reassembly queue links inside packet buffers, at whatever
+# offset the IP header has: the vendored code reads them through misaligned
+# pointers by design. ARM64 allows that, and reporting it stopped every run on
+# the first fragment of the seed corpus, before the fuzzer mutated anything.
+# The alignment check stays on for our own sources below.
 for source in "$slirp"/*.c; do
     "$clang" -g -O1 -std=gnu99 -D_DARWIN_C_SOURCE -DBUILDING_LIBSLIRP '-DG_LOG_DOMAIN="Slirp"' \
-        -fsanitize=fuzzer-no-link,address,undefined -I"$slirp" -I"$glib/include/glib-2.0" -I"$glib/lib/glib-2.0/include" \
+        -fsanitize=fuzzer-no-link,address,undefined -fno-sanitize=alignment -I"$slirp" -I"$glib/include/glib-2.0" -I"$glib/lib/glib-2.0/include" \
         -include "$native/slirp_policy.h" -c "$source" -o "$out/objects/$(basename "$source" .c).o"
 done
 "$clang" -g -O1 -Wall -Wextra -Werror -mmacosx-version-min=26.0 -fsanitize=fuzzer,address,undefined \

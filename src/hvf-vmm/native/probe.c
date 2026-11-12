@@ -29,7 +29,10 @@
 
 #define RAM_BASE 0x40000000ULL
 static size_t ram_size;
-static _Atomic uint64_t cpu_exits[4];
+// MAX_VCPUS and MAX_MEMORY_MIB in lib.rs are the same bounds.
+#define MAX_CPUS 8
+// One counter per vCPU. The metrics datagram still carries the first four.
+static _Atomic uint64_t cpu_exits[MAX_CPUS];
 static uint64_t clock_offset_ns;
 static uint32_t uart[19];
 static int snapshot_dirfd=-1;
@@ -75,8 +78,6 @@ static int mmio(uint64_t addr, unsigned size, int write, uint64_t *value) {
 }
 
 
-// MAX_VCPUS and MAX_MEMORY_MIB in lib.rs are the same bounds.
-#define MAX_CPUS 8
 struct cpu {
     hv_vcpu_t id;
     pthread_t thread;

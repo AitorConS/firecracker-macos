@@ -390,9 +390,11 @@ static int block_mmio(struct block *block,uint64_t addr,unsigned size,int write,
         case 19: *v=block->isr;block->isr=0;irq(block,0);break;
         // Legacy device config begins at byte 20; seg_max is at offset 12.
         // Reserve one ring descriptor each for the header and status byte.
-        case 32: if(size!=4)return 0; *v=QSZ-2; break;
+        // Like the capacity, it is read in any width: Linux reads the legacy
+        // device config one byte at a time.
         default:
             if(off>=20 && off+size<=28) *v=(block->disk_size/512)>>((off-20)*8);
+            else if(off>=32 && off+size<=36) *v=(uint32_t)(QSZ-2)>>((off-32)*8);
             else return 0;
         }
     }

@@ -23,6 +23,27 @@ mod tree;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const RAM_BASE: u64 = 0x4000_0000;
 const RAM_SIZE: u64 = 128 << 20;
+/// What a guest may be given. The native side has the same bounds (MAX_CPUS
+/// and the memory check in probe.c); `--capabilities` and GET /capabilities
+/// report them so that a launcher need not know them.
+pub(crate) const MAX_VCPUS: u32 = 8;
+pub(crate) const MIN_MEMORY_MIB: u32 = 64;
+pub(crate) const MAX_MEMORY_MIB: u32 = 8192;
+pub(crate) const MAX_DRIVES: usize = 4;
+/// The part of GET /capabilities that depends only on the build: what a
+/// launcher must know before it writes a config.
+pub(crate) fn static_capabilities() -> serde_json::Value {
+    serde_json::json!({
+        "api_version": "1.0",
+        "vmm_build_id": env!("HVF_BUILD_ID"),
+        "max_vcpus": MAX_VCPUS,
+        "memory_mib": [MIN_MEMORY_MIB, MAX_MEMORY_MIB],
+        "max_drives": MAX_DRIVES,
+        "boot_protocols": ["elf", "linux-image"],
+        "network_backends": ["slirp", "unix-stream"],
+        "peer_control": true,
+    })
+}
 // Native fatal errors terminate the process; preserve private-file cleanup in that
 // path as well as normal Rust unwinding. One VM is allowed per process.
 static PRIVATE_DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -160,11 +181,14 @@ impl Config {
         let security = self.security.as_ref().ok_or("SECURITY_MIGRATION_REQUIRED: add security version 1; use --migrate-config to inspect required permissions")?;
         security.validate()?;
         self.limits.validate()?;
-        if !(1..=4).contains(&self.machine_config.vcpu_count)
-            || !(64..=2048).contains(&self.machine_config.mem_size_mib)
+        if !(1..=MAX_VCPUS).contains(&self.machine_config.vcpu_count)
+            || !(MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&self.machine_config.mem_size_mib)
             || self.machine_config.smt
         {
-            return Err("HVF currently supports 1..4 vCPUs, 64..2048 MiB and no SMT".into());
+            return Err(format!(
+                "HVF currently supports 1..{MAX_VCPUS} vCPUs, {MIN_MEMORY_MIB}..{MAX_MEMORY_MIB} MiB and no SMT"
+            )
+            .into());
         }
         if self.boot_source.boot_protocol == BootProtocol::Elf
             && (self.boot_source.initrd_path.is_some() || self.boot_source.boot_args.is_some())
@@ -176,7 +200,7 @@ impl Config {
         {
             return Err("invalid boot_args".into());
         }
-        if self.drives.len() > 4 || self.drives.iter().filter(|d| d.is_root_device).count() > 1 {
+        if self.drives.len() > MAX_DRIVES || self.drives.iter().filter(|d| d.is_root_device).count() > 1 {
             return Err("at most four block devices and one optional root designation".into());
         }
         if self.firmware.len() > 64 {
@@ -571,7 +595,7 @@ fn entry(version: &str) -> Result<i32> {
             }
             "--help" => {
                 println!(
-                    "firecracker --no-api --config-file CONFIG [--check-config]\nfirecracker --api-sock SOCKET [--config-file CONFIG]\nfirecracker --migrate-config --config-file CONFIG\nExperimental macOS ARM64 backend; see experiments/hvf/README.md"
+                    "firecracker --no-api --config-file CONFIG [--check-config]\nfirecracker --api-sock SOCKET [--config-file CONFIG]\nfirecracker --migrate-config --config-file CONFIG\nfirecracker --capabilities\nExperimental macOS ARM64 backend; see experiments/hvf/README.md"
                 );
                 return Ok(0);
             }
@@ -581,6 +605,10 @@ fn entry(version: &str) -> Result<i32> {
                 socket = Some(PathBuf::from(args.next().ok_or("missing api-sock value")?))
             }
             "--check-config" => check = true,
+            "--capabilities" => {
+                println!("{}", static_capabilities());
+                return Ok(0);
+            }
             "--migrate-config" => migrate = true,
             "--config-file" => {
                 config = Some(PathBuf::from(

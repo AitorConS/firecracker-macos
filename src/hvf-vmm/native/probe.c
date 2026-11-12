@@ -75,7 +75,8 @@ static int mmio(uint64_t addr, unsigned size, int write, uint64_t *value) {
 }
 
 
-#define MAX_CPUS 4
+// MAX_VCPUS and MAX_MEMORY_MIB in lib.rs are the same bounds.
+#define MAX_CPUS 8
 struct cpu {
     hv_vcpu_t id;
     pthread_t thread;
@@ -375,7 +376,7 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
     if(options->snapshot_dir){snapshot_dirfd=open(options->snapshot_dir,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);if(snapshot_dirfd<0)return 1;}
     if(options->restore)pause_requested=1;
     ncpus=options->cpus;
-    if(options->memory_mib<64||options->memory_mib>2048)return 1;
+    if(options->memory_mib<64||options->memory_mib>8192)return 1;
     ram_size=(size_t)options->memory_mib<<20;
     if(ncpus<1 || ncpus>MAX_CPUS || entry<RAM_BASE || entry>=RAM_BASE+ram_size || (entry&3))return 1;
     int fd=options->restore?snapshot_open("ram.bin",1):open(ram_path,O_RDONLY);struct stat st;

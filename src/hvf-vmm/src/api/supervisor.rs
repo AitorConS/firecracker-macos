@@ -304,7 +304,7 @@ fn launch(
         reader,
         Reader::default(),
         super::metrics::NativeMetrics::new(metrics_reader),
-        crate::limits::Watchdog::new(&typed.limits),
+        crate::limits::Watchdog::new(&typed.limits, typed.machine_config.mem_size_mib),
         if restore.is_some() {
             Some(serde_json::to_value(&typed)?)
         } else {

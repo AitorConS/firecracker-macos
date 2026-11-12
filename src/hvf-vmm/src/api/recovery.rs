@@ -88,7 +88,13 @@ impl Workspace {
             owner: identity(std::process::id())?.ok_or("missing supervisor identity")?,
         };
         serde_json::to_writer(&lease, &marker)?;
-        lease.sync_all()?;
+        // Recovery refuses a directory whose marker it cannot read, and a
+        // power cut is the only event that could lose this write: hand it to
+        // the drive, without waiting for the drive to empty its cache.
+        // SAFETY: fsync only refers to the open descriptor.
+        if unsafe { libc::fsync(lease.as_raw_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
         Ok(Self { directory, lease })
     }
     pub fn path(&self) -> &Path {

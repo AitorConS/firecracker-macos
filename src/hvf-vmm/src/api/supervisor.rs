@@ -2,6 +2,7 @@
 //! Child ownership, asynchronous startup and deterministic teardown.
 use super::SHUTDOWN;
 use super::control::{Message, Reader};
+use super::wake::Waker;
 use crate::{Config, Result};
 use serde_json::Value;
 use std::fs;
@@ -25,22 +26,32 @@ impl Drop for StartTask {
         }
     }
 }
-pub(super) fn start_task(config: Value, path: PathBuf, operation: u64, lease_fd: i32) -> StartTask {
+pub(super) fn start_task(
+    config: Value,
+    path: PathBuf,
+    operation: u64,
+    lease_fd: i32,
+    waker: Waker,
+) -> StartTask {
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = cancel.clone();
     let thread = std::thread::spawn(move || {
-        launch(&config, &path, &worker_cancel, operation, lease_fd, None).map_err(|e| e.to_string())
+        let guest = launch(&config, &path, &worker_cancel, operation, lease_fd, None)
+            .map_err(|e| e.to_string());
+        waker.wake();
+        guest
     });
     StartTask {
         cancel,
         thread: Some(thread),
     }
 }
-pub(super) fn discard_task(guest: Guest) -> StartTask {
+pub(super) fn discard_task(guest: Guest, waker: Waker) -> StartTask {
     StartTask {
         cancel: Arc::new(AtomicBool::new(true)),
         thread: Some(std::thread::spawn(move || {
             drop(guest);
+            waker.wake();
             Err("startup cancelled".into())
         })),
     }
@@ -358,11 +369,12 @@ pub(super) fn restore_task(
     operation: u64,
     lease_fd: i32,
     restore_config: Value,
+    waker: Waker,
 ) -> StartTask {
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = cancel.clone();
     let thread = std::thread::spawn(move || {
-        (|| -> Result<Guest> {
+        let guest = (|| -> Result<Guest> {
             let stage = tempfile::tempdir_in(path.parent().ok_or("missing supervisor directory")?)?;
             let config = crate::snapshot::materialize(
                 &source,
@@ -381,7 +393,9 @@ pub(super) fn restore_task(
             guest.6 = Some(config.public_config);
             Ok(guest)
         })()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+        waker.wake();
+        guest
     });
     StartTask {
         cancel,

@@ -45,10 +45,11 @@ pub(crate) fn stage(
         return Err("boot input lock failed".into());
     }
     // A clone shares the input's blocks; otherwise only data is copied and
-    // zeros (most of a snapshot's RAM image) stay holes.
-    let output = if crate::sparse::clone_to(&source, destination)? {
+    // zeros (most of a snapshot's RAM image) stay holes. The copy lives in the
+    // supervisor's workspace, which recovery deletes whole once its owner is
+    // gone, so it is never read after a crash and is not flushed to the disk.
+    if crate::sparse::clone_to(&source, destination)? {
         std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))?;
-        File::open(destination)?
     } else {
         let output = OpenOptions::new()
             .write(true)
@@ -62,9 +63,7 @@ pub(crate) fn stage(
             Ok(())
         };
         crate::sparse::copy(&source, metadata.len(), Some(&output), None, &check)?;
-        output
-    };
-    output.sync_all()?;
+    }
     Ok(destination.to_owned())
 }
 #[cfg(test)]

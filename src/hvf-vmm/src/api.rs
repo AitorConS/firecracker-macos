@@ -10,6 +10,7 @@ mod operations;
 mod recovery;
 use control::Message;
 mod supervisor;
+mod wake;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -90,6 +91,8 @@ fn serve_inner(socket: &Path, initial: Option<Config>, headless: bool) -> Result
     let _guard = SocketGuard(socket.to_owned());
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
+    use std::os::fd::AsRawFd;
+    let wake = wake::Wake::new(listener.as_raw_fd())?;
     let work = recovery::Workspace::new()?;
     let child_config = work.path().join("config.json");
     let mut config = initial
@@ -115,11 +118,12 @@ fn serve_inner(socket: &Path, initial: Option<Config>, headless: bool) -> Result
             child_config.clone(),
             operation_id,
             work.lease_fd(),
+            wake.waker(),
         ))
     } else {
         None
     };
-    let mut transport = http::Transport::new();
+    let mut transport = http::Transport::new(wake.waker());
     let mut metrics = metrics::Metrics::new();
     let mut previous_state = State::NotStarted;
     eprintln!("HVF API: {}", socket.display());
@@ -141,13 +145,15 @@ fn serve_inner(socket: &Path, initial: Option<Config>, headless: bool) -> Result
                     } else {
                         State::Running
                     };
+                    // Its exit ends the loop's wait, as a finished start did.
+                    wake.watch_exit(guest.id());
                     child = Some(guest);
                     operations.finish("succeeded",if state==State::Paused{Some(json!({"restored_state":"Paused","network_reset":true,"format_version":1}))}else{None});
                 }
                 Ok(Ok(guest)) => {
                     // Reaping a cancelled child may take two seconds. Keep that
                     // teardown on a worker so the control plane stays responsive.
-                    pending = Some(discard_task(guest));
+                    pending = Some(discard_task(guest, wake.waker()));
                     state = State::Stopping;
                 }
                 Ok(Err(error)) => {
@@ -319,7 +325,10 @@ fn serve_inner(socket: &Path, initial: Option<Config>, headless: bool) -> Result
         }
         transport.accept(&listener)?;
         let Some((request, reply)) = transport.next() else {
-            std::thread::sleep(Duration::from_millis(5));
+            // A request, a connection, a finished start, the guest's exit and
+            // a stop signal end the wait at once. Deadlines, limits and the
+            // guest's control messages are found by the next pass.
+            wake.wait(Duration::from_millis(5));
             continue;
         };
         metrics.requests += 1;
@@ -421,6 +430,7 @@ fn serve_inner(socket: &Path, initial: Option<Config>, headless: bool) -> Result
                             operation_id,
                             work.lease_fd(),
                             config.clone(),
+                            wake.waker(),
                         ));
                     }
                     Ok((
@@ -460,6 +470,7 @@ fn serve_inner(socket: &Path, initial: Option<Config>, headless: bool) -> Result
                                 child_config.clone(),
                                 operation_id,
                                 work.lease_fd(),
+                                wake.waker(),
                             ));
                             Ok((
                                 202,

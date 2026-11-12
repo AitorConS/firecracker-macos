@@ -176,6 +176,7 @@ fn launch(
 ) -> Result<Guest> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
+    let started = std::time::Instant::now();
     let mut typed: Config = serde_json::from_value(config.clone())?;
     typed.validate()?;
     let work = tempfile::tempdir_in(path.parent().ok_or("missing supervisor directory")?)?;
@@ -253,6 +254,7 @@ fn launch(
             )?;
         }
     }
+    let staging = started.elapsed();
     let mut command = Command::new(std::env::current_exe()?);
     command
         .args(["--hvf-child", "--no-api", "--config-file"])
@@ -360,6 +362,8 @@ fn launch(
         .into());
     }
     guest.2.set_nonblocking(true)?;
+    guest.4.staging = staging;
+    guest.4.vmm = started.elapsed() - staging;
     Ok(guest)
 }
 

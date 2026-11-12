@@ -85,7 +85,8 @@ fn process(pid: u32) -> Option<libc::proc_taskinfo> {
     }
 }
 
-const NATIVE_NAMES: [&str; 26] = [
+const NATIVE_COUNT: usize = 37;
+const NATIVE_NAMES: [&str; NATIVE_COUNT] = [
     "vcpu_0_exits_total",
     "vcpu_1_exits_total",
     "vcpu_2_exits_total",
@@ -112,11 +113,27 @@ const NATIVE_NAMES: [&str; 26] = [
     "net_ipc_rx_dropped_bytes_total",
     "net_broker_metrics_dropped_samples_total",
     "native_metrics_dropped_samples_total",
+    "vcpu_4_exits_total",
+    "vcpu_5_exits_total",
+    "vcpu_6_exits_total",
+    "vcpu_7_exits_total",
+    // How long each step of the VMM's start took, in the order it ran them.
+    "startup_ram_microseconds",
+    "startup_devices_microseconds",
+    "startup_network_start_microseconds",
+    "startup_vm_microseconds",
+    "startup_sandbox_microseconds",
+    "startup_network_ready_microseconds",
+    "startup_vcpus_microseconds",
 ];
 pub(super) struct NativeMetrics {
     socket: std::os::unix::net::UnixDatagram,
-    sample: Option<[u64; 26]>,
+    sample: Option<[u64; NATIVE_COUNT]>,
     sampled: Instant,
+    /// What the supervisor measured of this start: staging the guest's
+    /// files, and from spawning the VMM to its report that the guest runs.
+    pub staging: std::time::Duration,
+    pub vmm: std::time::Duration,
 }
 impl NativeMetrics {
     pub fn new(socket: std::os::unix::net::UnixDatagram) -> Self {
@@ -124,15 +141,19 @@ impl NativeMetrics {
             socket,
             sample: None,
             sampled: Instant::now(),
+            staging: Default::default(),
+            vmm: Default::default(),
         }
     }
     pub fn poll(&mut self) {
         // The extra byte detects oversized/truncated datagrams.
-        let mut bytes = [0u8; 217];
+        let mut bytes = [0u8; 8 + NATIVE_COUNT * 8 + 1];
         for _ in 0..8 {
             match self.socket.recv(&mut bytes) {
-                Ok(216) if bytes[..8] == *b"HVFM\x02\x1a\0\0" => {
-                    let mut values = [0; 26];
+                Ok(n) if n == 8 + NATIVE_COUNT * 8
+                    && bytes[..8] == [b'H', b'V', b'F', b'M', 3, NATIVE_COUNT as u8, 0, 0] =>
+                {
+                    let mut values = [0; NATIVE_COUNT];
                     for (i, value) in values.iter_mut().enumerate() {
                         *value =
                             u64::from_le_bytes(bytes[8 + i * 8..16 + i * 8].try_into().unwrap());
@@ -151,6 +172,8 @@ impl NativeMetrics {
             .filter(|pid| *pid > 1)
     }
     pub fn merge(&self, target: &mut Value) {
+        target["startup_staging_microseconds"] = json!(self.staging.as_micros() as u64);
+        target["startup_vmm_microseconds"] = json!(self.vmm.as_micros() as u64);
         if let Some(values) = self.sample {
             for (name, value) in NATIVE_NAMES.into_iter().zip(values) {
                 if name == "net_ipc_readable_bytes" && value == u64::MAX {
@@ -171,23 +194,26 @@ mod tests {
         let (tx, rx) = std::os::unix::net::UnixDatagram::pair().unwrap();
         rx.set_nonblocking(true).unwrap();
         let mut metrics = NativeMetrics::new(rx);
-        let mut packet = [0; 216];
-        packet[..8].copy_from_slice(b"HVFM\x02\x1a\0\0");
+        let mut packet = [0; 8 + NATIVE_COUNT * 8];
+        packet[..8].copy_from_slice(&[b'H', b'V', b'F', b'M', 3, NATIVE_COUNT as u8, 0, 0]);
         packet[8..16].copy_from_slice(&42u64.to_le_bytes());
+        packet[8 + 30 * 8..8 + 31 * 8].copy_from_slice(&900u64.to_le_bytes());
         tx.send(&packet[..127]).unwrap();
         let mut oversized = packet.to_vec();
         oversized.push(0);
         tx.send(&oversized).unwrap();
-        packet[4] = 3;
+        packet[4] = 2;
         tx.send(&packet).unwrap();
         metrics.poll();
         let mut value = json!({});
         metrics.merge(&mut value);
-        assert!(value.as_object().unwrap().is_empty());
-        packet[4] = 2;
+        assert!(value.get("vcpu_0_exits_total").is_none());
+        packet[4] = 3;
         tx.send(&packet).unwrap();
         metrics.poll();
         metrics.merge(&mut value);
+        assert_eq!(value["startup_ram_microseconds"], 900);
+        assert_eq!(value["startup_staging_microseconds"], 0);
         assert_eq!(value["vcpu_0_exits_total"], 42);
     }
 }

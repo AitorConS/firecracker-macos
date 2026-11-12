@@ -3,6 +3,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 int hvf_gate_start(void);
+// hvf_gate_start() in two steps, for a caller with work to do in between.
+int hvf_gate_fork(void);
+int hvf_gate_wait(void);
 int hvf_gate_active(void);
 int hvf_gate_tcp(int fd,const struct sockaddr_in *,int listener);
 int hvf_gate_udp(void);

@@ -168,17 +168,30 @@ static void authority(int fd,pid_t parent){
     }
     _exit(0);
 }
-int hvf_gate_start(void){
+// The authority is forked before its parent confines itself, since it needs
+// more of the network than the parent keeps. It then confines itself, which
+// takes a few milliseconds the parent can spend on its own confinement:
+// hvf_gate_wait() is what makes the gate usable.
+static int starting=-1;
+int hvf_gate_fork(void){
     int pair[2];if(socketpair(AF_UNIX,SOCK_DGRAM,0,pair))return -1;
     pid_t parent=getpid(),child=fork();if(child<0){close(pair[0]);close(pair[1]);return -1;}
     if(!child){close(pair[0]);authority(pair[1],parent);}
     close(pair[1]);
-    struct pollfd ready={pair[0],POLLIN,0};struct reply reply;
-    if(poll(&ready,1,2000)<=0 || recv(pair[0],&reply,sizeof(reply),MSG_DONTWAIT)!=sizeof(reply) || reply.magic!=MAGIC || reply.id || reply.error){
-        close(pair[0]);kill(child,SIGKILL);while(waitpid(child,NULL,0)<0&&errno==EINTR){}errno=EPROTO;return -1;
-    }
-    channel=pair[0];authority_pid=child;return 0;
+    starting=pair[0];authority_pid=child;return 0;
 }
+int hvf_gate_wait(void){
+    int fd=starting;pid_t child=authority_pid;starting=-1;
+    if(fd<0){errno=EPROTO;return -1;}
+    struct pollfd ready={fd,POLLIN,0};struct reply reply;
+    if(poll(&ready,1,2000)<=0 || recv(fd,&reply,sizeof(reply),MSG_DONTWAIT)!=sizeof(reply) || reply.magic!=MAGIC || reply.id || reply.error){
+        // A confined parent may not be allowed the kill: the authority also
+        // exits on its own once this process, which gives up on it, is gone.
+        authority_pid=0;close(fd);kill(child,SIGKILL);while(waitpid(child,NULL,0)<0&&errno==EINTR){}errno=EPROTO;return -1;
+    }
+    channel=fd;return 0;
+}
+int hvf_gate_start(void){return hvf_gate_fork()?-1:hvf_gate_wait();}
 int hvf_gate_check(void){if(gate_failed)return -1;if(authority_pid<=0)return 0;int status;pid_t result=waitpid(authority_pid,&status,WNOHANG);return result==0 || (result<0&&errno==EINTR)?0:-1;}
 int hvf_gate_active(void){return channel>=0;}
 // A transport/protocol failure makes the synchronous channel unusable: a late

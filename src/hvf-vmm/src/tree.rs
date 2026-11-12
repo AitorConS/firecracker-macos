@@ -15,7 +15,12 @@ pub fn build(
     f.property_string("compatible", "linux,dummy-virt")?;
     let n = f.begin_node("memory@40000000")?;
     f.property_string("device_type", "memory")?;
-    f.property_array_u32("reg", &[0, 0x40000000, 0, memory_mib << 20])?;
+    // The size takes both cells: 4 GiB and more do not fit the low one.
+    let size = u64::from(memory_mib) << 20;
+    f.property_array_u32(
+        "reg",
+        &[0, 0x40000000, (size >> 32) as u32, size as u32],
+    )?;
     f.end_node(n)?;
     let n = f.begin_node("pcie@3f000000")?;
     f.property_string("compatible", "pci-host-ecam-generic")?;
@@ -124,4 +129,22 @@ pub fn build(
     f.end_node(n)?;
     f.end_node(root)?;
     Ok(f.finish()?)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// The cells of /memory's reg: address high, address low, size high, size low.
+    fn memory_reg(memory_mib: u32) -> [u32; 4] {
+        let dtb = build(1, memory_mib, false, None, None).unwrap();
+        // The only 16-byte property that starts with RAM's base address.
+        let base = [0u8, 0, 0, 0, 0x40, 0, 0, 0];
+        let at = dtb.windows(8).position(|w| w == base).unwrap();
+        std::array::from_fn(|i| u32::from_be_bytes(dtb[at + 4 * i..at + 4 * i + 4].try_into().unwrap()))
+    }
+    #[test]
+    fn memory_size_of_4_gib_and_more_uses_the_high_cell() {
+        assert_eq!(memory_reg(2048), [0, 0x4000_0000, 0, 0x8000_0000]);
+        assert_eq!(memory_reg(4096), [0, 0x4000_0000, 1, 0]);
+        assert_eq!(memory_reg(crate::MAX_MEMORY_MIB), [0, 0x4000_0000, 2, 0]);
+    }
 }

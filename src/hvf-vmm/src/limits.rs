@@ -19,13 +19,16 @@ pub(crate) struct Limits {
     pub open_files: u64,
     pub file_size_bytes: u64,
     pub cpu_seconds: u64,
-    pub rss_mib: u64,
+    /// None charges the guest's own size: see Watchdog::new.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rss_mib: Option<u64>,
     pub nice: i32,
     pub disk_bytes_per_second: u64,
     pub disk_operations_per_second: u64,
     pub network_bytes_per_second: u64,
     pub network_packets_per_second: u64,
 }
+const DEFAULT_RSS_FLOOR_MIB: u64 = 2 * 2048 + 1024;
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -33,11 +36,7 @@ impl Default for Limits {
             open_files: 1024,
             file_size_bytes: 16 << 30,
             cpu_seconds: 86400,
-            // HVF charges resident guest mappings in both host and hypervisor
-            // ledgers on macOS. A fully touched 2 GiB guest can report ~4 GiB
-            // RSS; retain another GiB for the VMM/broker and transient buffers.
-            // Explicit rss_mib values are still enforced without adjustment.
-            rss_mib: 5120,
+            rss_mib: None,
             nice: 5,
             // Device budgets should permit modern local storage by default;
             // operators can still set lower explicit byte and IOPS limits.
@@ -68,10 +67,10 @@ impl Limits {
             || !(64..=4096).contains(&self.open_files)
             || !(1 << 20..=1 << 40).contains(&self.file_size_bytes)
             || !(1..=31536000).contains(&self.cpu_seconds)
-            || !(64..=16384).contains(&self.rss_mib)
+            || self.rss_mib.is_some_and(|rss| !(64..=32768).contains(&rss))
             || !(0..=19).contains(&self.nice)
         {
-            return Err("invalid limits v1: open_files 64..4096, file_size_bytes 1 MiB..1 TiB, cpu_seconds 1..31536000, rss_mib 64..16384, nice 0..19".into());
+            return Err("invalid limits v1: open_files 64..4096, file_size_bytes 1 MiB..1 TiB, cpu_seconds 1..31536000, rss_mib 64..32768, nice 0..19".into());
         }
         Ok(())
     }
@@ -139,10 +138,18 @@ pub(crate) struct Watchdog {
     pub samples: u64,
 }
 impl Watchdog {
-    pub fn new(limits: &Limits) -> Self {
+    /// HVF charges resident guest mappings in both host and hypervisor
+    /// ledgers on macOS: a fully touched guest can report twice its memory.
+    /// Without an explicit rss_mib the budget is that plus another GiB for
+    /// the VMM, the broker and transient buffers, and never less than what a
+    /// 2 GiB guest gets. An explicit value is enforced without adjustment.
+    pub fn new(limits: &Limits, memory_mib: u32) -> Self {
+        let rss_mib = limits
+            .rss_mib
+            .unwrap_or_else(|| (2 * u64::from(memory_mib) + 1024).max(DEFAULT_RSS_FLOOR_MIB));
         Self {
             next: Instant::now(),
-            budget: limits.rss_mib << 20,
+            budget: rss_mib << 20,
             cpu_budget: limits.cpu_seconds * 1_000_000_000,
             ticks: Default::default(),
             cpu_ns: 0,
@@ -239,10 +246,15 @@ mod tests {
     #[test]
     fn default_rss_covers_maximum_guest_mappings() {
         let limits = Limits::default();
-        assert_eq!(limits.rss_mib, 2 * 2048 + 1024);
+        assert_eq!(Watchdog::new(&limits, 64).budget, (2 * 2048 + 1024) << 20);
+        assert_eq!(Watchdog::new(&limits, 2048).budget, (2 * 2048 + 1024) << 20);
+        assert_eq!(Watchdog::new(&limits, 8192).budget, (2 * 8192 + 1024) << 20);
+        // The default survives the supervisor's hand-off of the config to the VMM.
+        let copy: Limits = serde_json::from_str(&serde_json::to_string(&limits).unwrap()).unwrap();
+        assert_eq!(copy.rss_mib, None);
         let explicit: Limits = serde_json::from_str(r#"{"rss_mib":64}"#).unwrap();
         explicit.validate().unwrap();
-        assert_eq!(Watchdog::new(&explicit).budget, 64 << 20);
+        assert_eq!(Watchdog::new(&explicit, 8192).budget, 64 << 20);
     }
 
     #[test]

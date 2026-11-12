@@ -73,7 +73,9 @@ the lock; another PATH binary is not silently accepted.
   initrd or Linux arguments and rejects those fields.
 
 Both boot in EL1 with MMU off, masked interrupts, x0=DTB,
-x1=x2=x3=0. RAM at `0x40000000`; 1–4 CPUs and 64–2048 MiB of configurable RAM.
+x1=x2=x3=0. RAM at `0x40000000`; 1–8 CPUs and 64–8192 MiB of configurable RAM.
+`firecracker --capabilities` prints these bounds, the drive limit and whether
+direct VM-to-VM links are supported, as JSON, so a launcher need not hard-code them.
 VMM capacity does not imply that any guest fits in 64 MiB.
 The Linux example is validated with 256 MiB. Output-only PL011 console, GICv3, PSCI,
 legacy VirtIO PCI and MMIO fw_cfg. No interactive input console is offered.

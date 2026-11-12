@@ -401,6 +401,11 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
     if(options->security && !options->security->development && hvf_sandbox_install(options->security->vmm_profile)){
         net_close();devices_close();return 1;
     }
+    // The broker was started by net_init() and has been confining itself
+    // meanwhile. It must be ready before device state is restored or a vCPU runs.
+    if(options->network_enabled && net_backend_ready()){
+        fprintf(stderr,"network setup failed\n");net_close();devices_close();return 1;
+    }
     if(options->restore && snapshot_state(1,0)){fprintf(stderr,"device snapshot restore failed\n");return 2;}
     fprintf(stderr,"HVF: %u vCPU, %u MiB, entry=0x%llx\n",ncpus,options->memory_mib,entry);
     for(unsigned i=0;i<ncpus;i++) {

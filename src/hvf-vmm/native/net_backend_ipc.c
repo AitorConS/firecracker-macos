@@ -116,7 +116,8 @@ static void broker_main(const struct hvf_options *options){
     int is_stream=options->stream_path!=NULL;
     broker_stream=is_stream;
     if(options->security && !options->security->development &&
-       ((!is_stream && hvf_gate_start()) || hvf_sandbox_install(options->security->broker_profile))){
+       ((!is_stream && hvf_gate_fork()) || hvf_sandbox_install(options->security->broker_profile) ||
+        (!is_stream && hvf_gate_wait()))){
         (void)control_send(health,'E',0);_exit(2);
     }
     if(is_stream?stream_open(options,stream_deliver):slirp_backend_open(options,broker_deliver)){
@@ -244,6 +245,12 @@ int net_backend_open(const struct hvf_options *options,net_receive_fn receive){
         if(flags<0||fcntl(peers[0],F_SETFL,flags|O_NONBLOCK)||fcntl(peers[0],F_SETFD,FD_CLOEXEC)){close(peers[0]);peers[0]=-1;}
     }
     net_peer_open(peers[0],options->mac,receive);
+    return 0;
+}
+// The broker confines itself and opens its backend while the VMM goes on with
+// its own start-up. Nothing may be sent to it, and no vCPU may run, before
+// this reports it ready.
+int net_backend_ready(void){
     struct pollfd ready={health,POLLIN,0};
     struct control_reader reader={0};uint8_t kind=0;uint64_t operation=0;
     // Startup runs on the supervisor's asynchronous worker; runtime never blocks.

@@ -4,6 +4,8 @@
 #include "hvf.h"
 typedef ssize_t (*net_receive_fn)(const void *,size_t,void *);
 int net_backend_open(const struct hvf_options *,net_receive_fn);
+// Waits for the backend net_backend_open() started. On failure it is closed.
+int net_backend_ready(void);
 // Returns 0 when the broker socket or the bounded IPC queue is full; the caller
 // retains the VirtIO descriptor and retries the frame.
 int net_backend_send(const void *,size_t);

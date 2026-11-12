@@ -33,6 +33,11 @@ static size_t ram_size;
 #define MAX_CPUS 8
 // One counter per vCPU. The metrics datagram still carries the first four.
 static _Atomic uint64_t cpu_exits[MAX_CPUS];
+// Microseconds each step of hvf_run() took before the guest ran, in order:
+// load RAM, devices, start the network broker, create the VM, confine the
+// VMM, wait for the broker, create the vCPUs. Reported with every sample.
+#define STARTUP_STAGES 7
+static uint64_t startup_us[STARTUP_STAGES];
 static uint64_t clock_offset_ns;
 static uint32_t uart[19];
 static int snapshot_dirfd=-1;
@@ -382,6 +387,8 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
     if(ncpus<1 || ncpus>MAX_CPUS || entry<RAM_BASE || entry>=RAM_BASE+ram_size || (entry&3))return 1;
     int fd=options->restore?snapshot_open("ram.bin",1):open(ram_path,O_RDONLY);struct stat st;
     if(fd<0||fstat(fd,&st)||st.st_size<=0 || (uint64_t)st.st_size>ram_size){fprintf(stderr,"RAM image length does not match configured memory\n");if(fd>=0)close(fd);return 1;}
+    double stage_start=seconds();unsigned stage=0;
+#define STAGE_DONE() do{double now=seconds();startup_us[stage++]=(uint64_t)((now-stage_start)*1e6);stage_start=now;}while(0)
     void *ram=mmap(NULL,ram_size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
     if(ram==MAP_FAILED){perror("mmap");close(fd);return 1;}
     // Holes in the image are guest pages of zeros: they are left untouched in
@@ -389,9 +396,12 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
     struct ram_load load={.fd=fd,.ram=ram};
     if(snapshot_extents(fd,st.st_size,load_extent,&load)){perror("read RAM image");close(fd);munmap(ram,ram_size);return 1;}
     close(fd);
+    STAGE_DONE();
     input_init(ram,ram_size,options->power_button);
     if(devices_init(ram,ram_size,disk,options)){perror("disk");devices_close();munmap(ram,ram_size);return 1;}
+    STAGE_DONE();
     if(net_init(ram,ram_size,options)){fprintf(stderr,"network setup failed\n");net_close();devices_close();munmap(ram,ram_size);return 1;}
+    STAGE_DONE();
     CHECK(hv_vm_create(NULL));
     CHECK(hv_vm_map(ram,RAM_BASE,ram_size,HV_MEMORY_READ|HV_MEMORY_WRITE|HV_MEMORY_EXEC));
     hv_gic_config_t gic=hv_gic_config_create();
@@ -400,14 +410,17 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
     CHECK(hv_gic_config_set_msi_region_base(gic,0x08020000));
     CHECK(hv_gic_config_set_msi_interrupt_range(gic,64,64));
     CHECK(hv_gic_create(gic));os_release(gic);
+    STAGE_DONE();
     if(options->security && !options->security->development && hvf_sandbox_install(options->security->vmm_profile)){
         net_close();devices_close();return 1;
     }
+    STAGE_DONE();
     // The broker was started by net_init() and has been confining itself
     // meanwhile. It must be ready before device state is restored or a vCPU runs.
     if(options->network_enabled && net_backend_ready()){
         fprintf(stderr,"network setup failed\n");net_close();devices_close();return 1;
     }
+    STAGE_DONE();
     if(options->restore && snapshot_state(1,0)){fprintf(stderr,"device snapshot restore failed\n");return 2;}
     fprintf(stderr,"HVF: %u vCPU, %u MiB, entry=0x%llx\n",ncpus,options->memory_mib,entry);
     for(unsigned i=0;i<ncpus;i++) {
@@ -419,6 +432,8 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
     }
     pthread_mutex_lock(&state_lock);
     for(unsigned i=0;i<ncpus;i++)while(!cpus[i].ready)pthread_cond_wait(&state_change,&state_lock);
+    STAGE_DONE();
+#undef STAGE_DONE
     if(options->restore){
         uint64_t operation=strtoull(getenv("HVF_OPERATION_ID")?getenv("HVF_OPERATION_ID"):"0",NULL,10);
         net_backend_pause(1,operation);double until=seconds()+3;
@@ -503,12 +518,16 @@ int hvf_run(const char *ram_path,uint64_t entry,const char *disk,const struct hv
         if(phase && phase!=3 && seconds()>transition_deadline){fprintf(stderr,"HVF: pause/resume barrier deadline\n");finish(124);}
         if(power_pending && input_power_button()){power_pending=0;if(control_send(options->ready_fd,'A',power_operation))finish(143);}
         if(metrics_fd>=0 && seconds()>=next_metrics){
-            uint64_t values[26];
+            // 26 values since version 2; version 3 appends vCPUs 4..7 and the start-up steps.
+            uint64_t values[26+4+STARTUP_STAGES]={0};
             for(unsigned i=0;i<4;i++)values[i]=atomic_load_explicit(&cpu_exits[i],memory_order_relaxed);
+            for(unsigned i=4;i<MAX_CPUS;i++)values[26+i-4]=atomic_load_explicit(&cpu_exits[i],memory_order_relaxed);
+            for(unsigned i=0;i<STARTUP_STAGES;i++)values[30+i]=startup_us[i];
             devices_metrics(values+4);net_metrics(values+8);values[14]=(uint64_t)net_backend_pid();
             values[15]=devices_queue_depth();net_queue_depths(values+16);net_backend_metrics(values+18);values[25]=dropped_metrics;
-            uint8_t packet[8+26*8]={'H','V','F','M',2,26,0,0};
-            for(unsigned i=0;i<26;i++)for(unsigned j=0;j<8;j++)packet[8+i*8+j]=(uint8_t)(values[i]>>(8*j));
+            enum{COUNT=sizeof(values)/sizeof(values[0])};
+            uint8_t packet[8+COUNT*8]={'H','V','F','M',3,COUNT,0,0};
+            for(unsigned i=0;i<COUNT;i++)for(unsigned j=0;j<8;j++)packet[8+i*8+j]=(uint8_t)(values[i]>>(8*j));
             // Datagram telemetry is best-effort and cannot hold up guest/control progress.
             if(send(metrics_fd,packet,sizeof(packet),MSG_DONTWAIT)!=(ssize_t)sizeof(packet))dropped_metrics++;
             next_metrics=seconds()+0.1;

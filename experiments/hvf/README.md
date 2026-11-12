@@ -387,8 +387,16 @@ VirtIO and IPC queues, IPC drops and telemetry sample losses. CPU is
 expressed in host ticks. Operation result and duration counters
 are preserved even if an operation is evicted from the 64-entry history.
 Current state duration and accumulated time per state are also published.
-The private metrics channel uses version 2 with 26 bounded fields; truncated
+The private metrics channel uses version 3 with 37 bounded fields; truncated
 or unknown-version frames are rejected.
+
+How long the last start took is published per step, in microseconds:
+`startup_staging_microseconds` (the supervisor staging the guest's files) and
+`startup_vmm_microseconds` (from spawning the VMM to its report that the guest
+runs), and inside the VMM, in the order they run, `startup_ram_`, `_devices_`,
+`_network_start_`, `_vm_`, `_sandbox_`, `_network_ready_` and
+`_vcpus_microseconds`. `startup_vmm_microseconds` minus those seven is the
+VMM's exec, its reading of the config and the building of the RAM image.
 
 ```sh
 python3 experiments/hvf/test-snapshot-linux.py --config build/linux-guest/config.json

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Bounded HTTP workers keep slow clients out of the lifecycle loop.
+use super::wake::Waker;
 use crate::Result;
 use serde_json::{Value, json};
 use std::io::{Read, Write};
@@ -21,9 +22,10 @@ pub(super) struct Transport {
     workers: Vec<JoinHandle<()>>,
     pub rejected: u64,
     queued: Arc<AtomicUsize>,
+    waker: Waker,
 }
 impl Transport {
-    pub fn new() -> Self {
+    pub fn new(waker: Waker) -> Self {
         let (sender, receiver) = mpsc::sync_channel(MAX_CONNECTIONS);
         Self {
             sender,
@@ -31,6 +33,7 @@ impl Transport {
             workers: Vec::new(),
             rejected: 0,
             queued: Arc::new(AtomicUsize::new(0)),
+            waker,
         }
     }
     pub fn accept(&mut self, listener: &UnixListener) -> Result<()> {
@@ -49,6 +52,7 @@ impl Transport {
             }
             let sender = self.sender.clone();
             let queued = self.queued.clone();
+            let waker = self.waker;
             self.workers.push(thread::spawn(move || {
                 let mut prometheus = false;
                 let reply = match request(&mut stream) {
@@ -60,6 +64,7 @@ impl Transport {
                             queued.fetch_sub(1, Ordering::Relaxed);
                             return;
                         }
+                        waker.wake();
                         match rx.recv_timeout(Duration::from_secs(2)) {
                             Ok(reply) => reply,
                             Err(_) => return,

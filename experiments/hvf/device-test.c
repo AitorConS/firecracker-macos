@@ -38,6 +38,10 @@ int main(int argc,char **argv){
     assert(hv_gic_config_set_redistributor_base(gc,0x80a0000)==HV_SUCCESS);
     assert(hv_gic_create(gc)==HV_SUCCESS);os_release(gc);
     hv_vcpu_t cpu;hv_vcpu_exit_t *ex;assert(hv_vcpu_create(&cpu,&ex,NULL)==HV_SUCCESS);
+    // seg_max, in the legacy device config, is read whole or a byte at a time (Linux).
+    {uint64_t whole=0,built=0;assert(mmio(BAR+32,4,0,&whole)&&whole==254);
+     for(unsigned i=0;i<4;i++){uint64_t byte=0;assert(mmio(BAR+32+i,1,0,&byte));built|=(byte&255)<<(8*i);}
+     assert(built==whole);assert(!mmio(BAR+34,4,0,&whole));}
     struct descriptor *desc=(void*)(ram+0x10000);
     desc[0]=(struct descriptor){BASE+0x20000,16,1,1};
     desc[1]=(struct descriptor){BASE+0x30000,512,3,2};

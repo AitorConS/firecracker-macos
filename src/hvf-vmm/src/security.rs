@@ -43,6 +43,11 @@ pub(crate) struct Security {
     #[serde(default)]
     pub listeners: Vec<Endpoint>,
     pub dns: Option<Resolver>,
+    /// Grants TCP and UDP to every public IPv4 address, beside the exact
+    /// `egress` rules: the Internet, but not this host's loopback nor private,
+    /// shared or link-local networks. It names no resolver; `dns` does.
+    #[serde(default)]
+    pub public_egress: bool,
     #[serde(default)]
     pub unix_stream: Option<std::path::PathBuf>,
     /// Peer control socket of the external switch (direct VM-to-VM links).
@@ -58,6 +63,7 @@ impl Default for Security {
             egress: Vec::new(),
             listeners: Vec::new(),
             dns: None,
+            public_egress: false,
             unix_stream: None,
             unix_control: None,
         }
@@ -96,7 +102,10 @@ impl Security {
             endpoint(dns.address, dns.port)?;
         }
         if self.mode == Mode::Development
-            && (!self.egress.is_empty() || !self.listeners.is_empty() || self.dns.is_some())
+            && (!self.egress.is_empty()
+                || !self.listeners.is_empty()
+                || self.dns.is_some()
+                || self.public_egress)
         {
             return Err("development mode cannot imply enforcement of permission lists".into());
         }
@@ -125,6 +134,7 @@ pub(crate) struct NativeSecurity {
     development: u32,
     egress_count: u32,
     listener_count: u32,
+    public_egress: u32,
     dns_address: [u8; 4],
     dns_port: u16,
     egress: *const NativeEndpoint,
@@ -208,6 +218,7 @@ impl Policy {
             development: (config.mode == Mode::Development).into(),
             egress_count: egress.len() as u32,
             listener_count: listeners.len() as u32,
+            public_egress: config.public_egress.into(),
             dns_address: config
                 .dns
                 .as_ref()
@@ -291,6 +302,21 @@ mod tests {
             assert!(policy.permits_listener(proto, Ipv4Addr::LOCALHOST, 8080));
             assert!(!policy.permits_listener(proto, Ipv4Addr::UNSPECIFIED, 8080));
         }
+    }
+    #[test]
+    fn public_egress_is_off_unless_asked_and_never_in_development() {
+        let parsed: Security = serde_json::from_str(r#"{"version":1}"#).unwrap();
+        assert!(!parsed.public_egress);
+        let parsed: Security =
+            serde_json::from_str(r#"{"version":1,"public_egress":true}"#).unwrap();
+        assert!(parsed.public_egress);
+        parsed.validate().unwrap();
+        let dev = Security {
+            mode: Mode::Development,
+            public_egress: true,
+            ..Security::default()
+        };
+        assert!(dev.validate().is_err());
     }
     #[test]
     fn rejects_wildcards_versions_and_duplicates() {

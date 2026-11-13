@@ -22,11 +22,26 @@ static int match(const struct hvf_endpoint *rules,unsigned count,int type,const 
     for(unsigned i=0;i<count;i++)if(rules[i].udp==(type==SOCK_DGRAM) && rules[i].port==ntohs(address->sin_port) && !memcmp(rules[i].address,&address->sin_addr,4))return 1;
     return 0;
 }
+// Public means routable on the Internet: not this host, not a private,
+// shared (CGNAT) or link-local network, not multicast or reserved space.
+// public_egress grants these and nothing nearer, so a guest reaches the
+// Internet without reaching the host's loopback or the LAN around it.
+int hvf_policy_public(const struct in_addr *address){
+    static const struct {uint32_t net;unsigned bits;} closed[]={
+        {0x00000000,8},{0x0a000000,8},{0x64400000,10},{0x7f000000,8},
+        {0xa9fe0000,16},{0xac100000,12},{0xc0a80000,16},{0xe0000000,3},
+    };
+    uint32_t value=ntohl(address->s_addr);
+    for(unsigned i=0;i<sizeof(closed)/sizeof(closed[0]);i++)
+        if((value>>(32-closed[i].bits))==(closed[i].net>>(32-closed[i].bits)))return 0;
+    return 1;
+}
 int hvf_policy_allows(int type,const struct sockaddr_in *v4,int listener){
     if(policy->development)return 1;
     if(!v4||v4->sin_family!=AF_INET||(type!=SOCK_DGRAM&&type!=SOCK_STREAM))return 0;
     if(listener)return match(policy->listeners,policy->listener_count,type,v4);
     if(policy->dns_port && policy->dns_port==ntohs(v4->sin_port) && !memcmp(policy->dns_address,&v4->sin_addr,4))return 1;
+    if(policy->public_egress && v4->sin_port && hvf_policy_public(&v4->sin_addr))return 1;
     return match(policy->egress,policy->egress_count,type,v4);
 }
 static int authorized(int fd,const struct sockaddr *address,socklen_t length,int listener){

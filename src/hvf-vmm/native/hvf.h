@@ -7,6 +7,8 @@ struct hvf_forward { uint32_t udp; uint8_t host_addr[4],guest_addr[4]; uint16_t 
 struct hvf_endpoint { uint32_t udp; uint8_t address[4]; uint16_t port; };
 struct hvf_security {
     uint32_t development,egress_count,listener_count;
+    uint32_t public_egress; // any public IPv4 destination, see hvf_policy_public
+
     uint8_t dns_address[4];uint16_t dns_port;
     const struct hvf_endpoint *egress,*listeners;
     const char *vmm_profile,*broker_profile;

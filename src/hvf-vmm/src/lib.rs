@@ -45,6 +45,7 @@ pub(crate) fn static_capabilities() -> serde_json::Value {
         "network_backends": ["slirp", "unix-stream"],
         "peer_control": true,
         "slirp_mtu_max": MAX_SLIRP_MTU,
+        "public_egress": true,
     })
 }
 // Native fatal errors terminate the process; preserve private-file cleanup in that

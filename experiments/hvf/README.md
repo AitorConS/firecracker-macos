@@ -128,7 +128,11 @@ mounts or filesystem labels interpreted by the VMM.
 Network: optional interface independent of `forwards`, configurable unicast MAC,
 up to 64 explicit TCP/UDP IPv4 rules with addresses/ports. An interface without
 forwarding rules can only egress to destinations authorized in `security`;
-egress and DNS are denied by default. slirp provides NAT/DHCP/DNS on
+egress and DNS are denied by default. `"public_egress": true` authorizes TCP
+and UDP to every public IPv4 address beside the exact rules: the Internet, but
+not the host's loopback nor private (10/8, 172.16/12, 192.168/16), shared
+(100.64/10), link-local (169.254/16), multicast or reserved addresses. It
+names no resolver: `dns` still does, and may be a private address. slirp provides NAT/DHCP/DNS on
 `10.0.2.0/24` (gateway `.2`, DNS `.3`, DHCP from `.15`). The transport is behind
 `net_backend.h`, separate from VirtIO; it supports slirp and the generic
 `unix-stream` transport described in [UNIX_STREAM.md](UNIX_STREAM.md).

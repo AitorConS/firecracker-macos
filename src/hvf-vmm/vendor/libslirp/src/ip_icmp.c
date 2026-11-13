@@ -341,7 +341,7 @@ void icmp_forward_error(struct mbuf *msrc, uint8_t type, uint8_t code, int minsi
         goto end_error; /* Only reply to fragment 0 */
 
     /* Do not reply to source-only IPs */
-    if ((ip->ip_src.s_addr & htonl(~(0xf << 28))) == 0) {
+    if ((ip->ip_src.s_addr & htonl(~(0xfU << 28))) == 0) {
         goto end_error;
     }
 

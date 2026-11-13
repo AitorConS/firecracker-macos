@@ -114,6 +114,17 @@
              sin->sin_port = htons(53);
  
          break;
+--- a/src/ip_icmp.c
++++ b/src/ip_icmp.c
+@@ -341,7 +341,7 @@
+         goto end_error; /* Only reply to fragment 0 */
+ 
+     /* Do not reply to source-only IPs */
+-    if ((ip->ip_src.s_addr & htonl(~(0xf << 28))) == 0) {
++    if ((ip->ip_src.s_addr & htonl(~(0xfU << 28))) == 0) {
+         goto end_error;
+     }
+ 
 --- a/src/ip_input.c
 +++ b/src/ip_input.c
 @@ -226,7 +226,7 @@

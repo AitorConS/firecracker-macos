@@ -11,6 +11,9 @@ a UBSan finding reproduced by the final campaign's fragment corpus.
 It validates the declared and available length of NC-SI packets before reading
 OEM payloads, including Mellanox-specific fields. The permanent corpus
 `ncsi-oem-truncated-payload` reproduces the original out-of-bounds read.
+It builds the source mask of ICMP errors from an unsigned constant: `0xf << 28`
+overflows a signed int, which UBSan reports although compilers produce the
+intended mask. The permanent corpus `icmp-error-source-mask` reproduces it.
 `libslirp-version.h` is derived from the upstream template with the version pinned
 in `libslirp.json` and is checked into Git so that direct builds do not depend
 on a prior Meson configuration. When updating libslirp, also update
